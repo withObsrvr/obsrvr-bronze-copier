@@ -1,6 +1,6 @@
 # Bronze Copier - Developer Handoff Document
 
-**Phase:** Cycle 1 Complete - Data Flow MVP with GCS Integration
+**Phase:** Cycle 3 Complete - Production Ready with Audit Trail
 **Date:** 2025-11-23
 **Author:** Claude Code
 
@@ -8,134 +8,202 @@
 
 ## Executive Summary
 
-This document summarizes the completion of **Cycle 1** of the Bronze Copier implementation. The MVP data flow is now fully functional: the system can read ledger archives from GCS using the official Stellar datastore package, transform them to parquet, and write to storage with checkpointing.
+This document summarizes the completion of **all three cycles** of the Bronze Copier implementation. The system is now production-ready with:
 
-**Key Achievement:** Successfully tested end-to-end with real testnet data from `obsrvr-stellar-ledger-data-testnet-data/landing/ledgers/testnet`.
+- Full data flow from Galexie archives to versioned parquet output
+- PostgreSQL catalog for metadata tracking and lineage
+- Hash-chained PAS (Public Audit Stream) events for tamper detection
+- Parallel commit processing for improved throughput
+- CLI with config validation
 
----
-
-## What Was Completed
-
-### 1. Archive Sources (Pitch 01)
-
-**Files:**
-- `internal/source/source.go` - Interface and factory
-- `internal/source/datastore.go` - **NEW: Official Stellar datastore integration (recommended)**
-- `internal/source/decoder.go` - XDR/zstd decoding
-- `internal/source/index.go` - Galexie file indexing
-- `internal/source/local.go` - Local filesystem source
-- `internal/source/gcs.go` - Direct GCS source (legacy)
-- `internal/source/s3.go` - S3-compatible source (B2, R2, MinIO)
-
-**Capabilities:**
-- **Datastore mode** (recommended): Uses official Stellar `ledgerbackend.BufferedStorageBackend`
-- Reads zstd-compressed XDR files from local/GCS/S3
-- Parses Galexie filename format (`{hash}--{ledger_seq}.xdr.zst`)
-- Streams ledgers in sequence order with buffered parallel reads
-- Validated with real testnet data
-
-**Galexie Schema:**
-- 1 ledger per file
-- 64000 files per partition (range directory)
-
-### 2. Parquet Transform (Pitch 02)
-
-**Files:**
-- `internal/tables/schema.go` - `LedgersLCMRawRow` schema definition
-- `internal/tables/extractor.go` - XDR to row extraction
-- `internal/tables/partition.go` - Partition building and parquet generation
-- `internal/tables/checksum.go` - SHA256 checksum utilities
-
-**Capabilities:**
-- Transforms `LedgerCloseMeta` to parquet rows
-- Supports LCM versions 0, 1, and 2
-- Deterministic output (same input = same checksum)
-- Snappy compression by default
-- Extracts header fields for queryability while preserving raw XDR
-
-### 3. Storage Backends (Pitch 03)
-
-**Files:**
-- `internal/storage/store.go` - Interface and types
-- `internal/storage/local.go` - Local filesystem storage
-- `internal/storage/gcs.go` - GCS storage
-- `internal/storage/s3.go` - S3-compatible storage
-
-**Capabilities:**
-- Atomic writes (temp file + rename for local)
-- Versioned path structure: `{prefix}/{network}/{era}/{version}/{table}/range={start}-{end}/`
-- Manifest file generation with checksums
-- Duplicate detection
-
-### 4. Checkpointing (Pitch 04)
-
-**Files:**
-- `internal/checkpoint/checkpoint.go` - Checkpoint manager
-
-**Capabilities:**
-- Saves progress after each partition
-- **Tested: Resumes from last committed ledger on restart**
-- Per-era/version checkpoint files
-- Validates checkpoint matches current config
-
-### 5. Configuration
-
-**Files:**
-- `internal/config/config.go` - YAML and environment variable config
-- `config.example.yaml` - Example configuration
-
-**Capabilities:**
-- YAML file or environment variable configuration
-- All source/storage options configurable
-- **New: `datastore` source mode for Galexie archives**
-- Era/version/network settings
-- Partition size control
+**Status:** Ready for production deployment
 
 ---
 
-## What Was NOT Completed (Deferred to Cycle 2+)
+## Cycle Completion Summary
 
-### From Original Scope
+### Cycle 1: Data Flow MVP ✅
 
-1. **Catalog Metadata Writer** - `_meta_*` tables not implemented
-   - Currently a no-op implementation
-   - Needed for: lineage tracking, coverage queries
+- Archive sources (datastore, GCS, S3, local)
+- Parquet transform with deterministic checksums
+- Storage backends with manifest files
+- Checkpointing for resume capability
 
-2. **PAS Emitter** - No actual PAS emission
-   - Currently a no-op implementation
-   - Needed for: public audit stream, verification
+### Cycle 2: Production Readiness ✅
 
-3. **Parallel Commits** - Single-threaded only
-   - `MaxInFlightPartitions` config exists but not used
-   - Needed for: throughput optimization
+- PostgreSQL catalog integration
+- Lineage tracking (source -> partition records)
+- Dataset registration
 
-4. **Live Source** - Only archive sources implemented
-   - No gRPC streaming support
-   - Needed for: real-time tailing
+### Cycle 3: Audit & Polish ✅
+
+- PAS Emitter with hash chaining
+- Parallel commits for throughput
+- CLI flags (`-config`, `-version`, `-validate`)
+- Config validation
+- Documentation and runbooks
 
 ---
 
-## Dependencies
+## What Was Implemented
+
+### PAS (Public Audit Stream)
+
+**Files:**
+- `internal/pas/event.go` - PAS v1.1 event schema
+- `internal/pas/chain.go` - SHA256 hash computation and chain tracking
+- `internal/pas/http.go` - HTTP emitter with retry
+- `internal/pas/file.go` - Local file backup
+- `internal/pas/emitter.go` - Factory and interface
+
+**Capabilities:**
+- Emits hash-chained events for each partition
+- Supports HTTP endpoint with exponential backoff retry
+- Always writes local backup files
+- Persists chain head hashes for continuity across restarts
+- Creates tamper-evident audit trail
+
+**Event Structure (v1.1):**
+```json
+{
+  "version": "1.1",
+  "event_type": "bronze_partition",
+  "event_id": "pas_evt_...",
+  "timestamp": "...",
+  "partition": { network, era_id, version_label, ledger_start, ledger_end },
+  "tables": { "ledgers_lcm_raw": { checksum, row_count, storage_path, byte_size } },
+  "producer": { name, version, git_sha },
+  "chain": { prev_event_hash, event_hash }
+}
+```
+
+### Parallel Commits
+
+**Files:**
+- `internal/copier/parallel.go` - ParallelCommitter implementation
+- `internal/copier/copier.go` - Integration with `runParallel()`
+
+**Capabilities:**
+- Semaphore-based concurrency control
+- Configurable via `MAX_IN_FLIGHT_PARTITIONS` (default: 4)
+- Parallel parquet generation and storage writes
+- Sequential PAS emission (maintains hash chain)
+- Thread-safe result tracking with condition variables
+
+**Performance:**
+- Sequential: ~29 ledgers/sec
+- Parallel (4 workers): ~53 ledgers/sec
+
+### CLI Improvements
+
+**Files:**
+- `cmd/bronze-copier/main.go` - CLI flag handling
+- `internal/config/config.go` - Validation function
+
+**Capabilities:**
+- `-config path` - Specify YAML config file
+- `-version` - Show version and exit
+- `-validate` - Validate config without running
+- Comprehensive config validation with clear error messages
+
+### Catalog Metadata
+
+**Files:**
+- `internal/metadata/writer.go` - PostgreSQL writer
+- `internal/metadata/schema.go` - Database schema
+
+**Capabilities:**
+- Dataset registration (domain, table, version, era)
+- Partition record tracking (checksums, row counts, byte sizes)
+- Lineage information (source type, source location)
+- Auto-creates tables on first use
+
+---
+
+## Architecture
 
 ```
-github.com/stellar/go v0.0.0-20251121214806-3e8d3b7222e6  # XDR types + datastore
-github.com/klauspost/compress v1.17.11                    # zstd decompression
-github.com/parquet-go/parquet-go v0.24.0                  # Parquet writing
-gocloud.dev v0.40.0                                       # GCS/S3 abstraction
-gopkg.in/yaml.v3 v3.0.1                                   # YAML config
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            Bronze Copier                                  │
+│                                                                           │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                   │
+│  │   Source    │───▶│  Partition  │───▶│   Storage   │                   │
+│  │ (Datastore) │    │  Builder    │    │ (GCS/S3/FS) │                   │
+│  └─────────────┘    └─────────────┘    └─────────────┘                   │
+│         │                  │                  │                           │
+│         ▼                  ▼                  ▼                           │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                   │
+│  │   Decoder   │    │   Parquet   │    │  Manifest   │                   │
+│  │  (XDR/zstd) │    │   Writer    │    │   Writer    │                   │
+│  └─────────────┘    └─────────────┘    └─────────────┘                   │
+│                            │                                              │
+│              ┌─────────────┼─────────────┬─────────────┐                 │
+│              ▼             ▼             ▼             ▼                 │
+│       ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐           │
+│       │ Checkpoint│ │  Catalog  │ │    PAS    │ │  Parallel │           │
+│       │  (JSON)   │ │(PostgreSQL│ │ (HTTP/FS) │ │ Committer │           │
+│       └───────────┘ └───────────┘ └───────────┘ └───────────┘           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## File Structure
+
+```
+obsrvr-bronze-copier/
+├── cmd/bronze-copier/
+│   └── main.go                 # Entry point with CLI flags
+├── internal/
+│   ├── checkpoint/
+│   │   └── checkpoint.go       # Checkpoint management
+│   ├── config/
+│   │   └── config.go           # Config + validation
+│   ├── copier/
+│   │   ├── copier.go           # Main orchestration
+│   │   └── parallel.go         # Parallel commit handler
+│   ├── metadata/
+│   │   ├── writer.go           # PostgreSQL catalog
+│   │   └── schema.go           # DB schema
+│   ├── pas/
+│   │   ├── event.go            # PAS v1.1 types
+│   │   ├── chain.go            # Hash chain tracking
+│   │   ├── http.go             # HTTP emitter
+│   │   ├── file.go             # File backup
+│   │   └── emitter.go          # Interface + factory
+│   ├── source/
+│   │   ├── datastore.go        # Stellar datastore (recommended)
+│   │   ├── decoder.go          # XDR decoding
+│   │   ├── gcs.go, s3.go, local.go
+│   │   └── source.go           # Interface
+│   ├── storage/
+│   │   ├── gcs.go, s3.go, local.go
+│   │   └── store.go            # Interface
+│   └── tables/
+│       ├── schema.go           # Parquet schema
+│       ├── extractor.go        # XDR extraction
+│       └── partition.go        # Partition building
+├── docs/
+│   ├── shaping/                # Shape Up documents
+│   ├── DEVELOPER-HANDOFF.md    # This document
+│   └── RUNBOOK.md              # Operational runbook
+├── config.example.yaml
+├── flake.nix
+└── README.md
 ```
 
 ---
 
 ## How to Test
 
-### GCS Testnet (Recommended)
+### Full Integration Test
 
 ```bash
 # Build
-go build -o bronze-copier ./cmd/bronze-copier
+nix build
+cp result/bin/bronze-copier ./bronze-copier
 
-# Run with datastore mode (uses official Stellar datastore)
+# Run with all features
 SOURCE_MODE=datastore \
 SOURCE_DATASTORE_TYPE=GCS \
 SOURCE_DATASTORE_PATH=obsrvr-stellar-ledger-data-testnet-data/landing/ledgers/testnet \
@@ -145,144 +213,96 @@ NETWORK=testnet \
 ERA_ID=pre_p23 \
 VERSION_LABEL=v1 \
 LEDGER_START=704000 \
-LEDGER_END=704100 \
-PARTITION_SIZE=100 \
-CHECKPOINT_ENABLED=true \
-CHECKPOINT_DIR=./checkpoints \
+LEDGER_END=704030 \
+PARTITION_SIZE=10 \
+PAS_ENABLED=true \
+PAS_BACKUP_DIR=./pas-backup \
+MAX_IN_FLIGHT_PARTITIONS=4 \
 ./bronze-copier
+
+# Verify PAS hash chain
+for f in pas-backup/*.json; do
+    echo "=== $f ==="
+    jq '.chain' "$f"
+done
 ```
 
-### Local Development
+### Config Validation
 
 ```bash
-# Run with local source and storage
-SOURCE_MODE=local \
-SOURCE_LOCAL_PATH=./testdata/archive \
-STORAGE_BACKEND=local \
-STORAGE_LOCAL_DIR=./output \
-LEDGER_START=1 \
-LEDGER_END=100 \
-PARTITION_SIZE=10 \
-./bronze-copier
+./bronze-copier -config config.example.yaml -validate
 ```
-
-### Test Data Requirements
-
-For local testing, you need Galexie-format archive files:
-```
-testdata/archive/
-  {hash}--{start}-{end}/
-    {hash}--{ledger_seq}.xdr.zst
-```
-
-For GCS testing, use the testnet bucket: `obsrvr-stellar-ledger-data-testnet-data/landing/ledgers/testnet`
 
 ---
 
-## Test Results
+## Test Results (2025-11-23)
 
-### End-to-End Test (2025-11-23)
+### End-to-End Test
 
 ```
 Source: gs://obsrvr-stellar-ledger-data-testnet-data/landing/ledgers/testnet
-Range: 704000-704020
+Range: 704000-704030
+Mode: Parallel (4 workers)
 Result: SUCCESS
 
-Output:
-- ./output/bronze/testnet/pre_p23/v1/ledgers_lcm_raw/range=704000-704009/
-- ./output/bronze/testnet/pre_p23/v1/ledgers_lcm_raw/range=704010-704010/
-- ./output/bronze/testnet/pre_p23/v1/ledgers_lcm_raw/range=704011-704020/
+Output: 4 partitions
+- range=704000-704009 (10 ledgers)
+- range=704010-704019 (10 ledgers)
+- range=704020-704029 (10 ledgers)
+- range=704030-704030 (1 ledger)
 
-Throughput: ~29 ledgers/sec
-Resume: Verified working
-Checksums: Verified deterministic
+PAS Events: 4 events, hash chain verified
+Throughput: 53 ledgers/sec
 ```
 
 ---
 
-## Known Issues / Technical Debt
+## Known Limitations
 
-1. **No unit tests** - Tests should be added
-2. **Error handling could be improved** - Some errors are logged but not propagated
-3. **No metrics** - Prometheus metrics not implemented
-4. **Flake.nix vendorHash** - Needs update for nix build
-5. **Legacy GCS/S3 sources** - Direct blob access works but datastore mode is preferred
-
----
-
-## Recommended Next Steps (Cycle 2)
-
-### Priority 1: Catalog Writer
-- Implement PostgreSQL writer for `_meta_lineage`
-- Add `_meta_datasets` registration
-- Enable coverage queries
-
-### Priority 2: Scale Testing
-- Run against full pubnet archive
-- Measure throughput at scale
-- Tune `BufferSize` and `NumWorkers`
-
-### Priority 3: Metrics & Observability
-- Add Prometheus metrics
-- Implement structured logging
-- Add health check endpoint
+1. **No unit tests** - Integration tests only
+2. **No Prometheus metrics** - Logs only
+3. **Single table only** - `ledgers_lcm_raw` only (other tables in icebox)
+4. **No live streaming** - Archive sources only
 
 ---
 
-## File Structure
+## Recommended Next Steps
 
-```
-obsrvr-bronze-copier/
-├── cmd/bronze-copier/
-│   └── main.go                 # Entry point
-├── internal/
-│   ├── checkpoint/
-│   │   └── checkpoint.go       # Checkpoint management
-│   ├── config/
-│   │   └── config.go           # Configuration loading
-│   ├── copier/
-│   │   └── copier.go           # Main orchestration
-│   ├── metadata/
-│   │   └── writer.go           # Catalog writer (no-op)
-│   ├── pas/
-│   │   └── emitter.go          # PAS emitter (no-op)
-│   ├── source/
-│   │   ├── datastore.go        # Official Stellar datastore (recommended)
-│   │   ├── decoder.go          # XDR decoding
-│   │   ├── gcs.go              # Direct GCS source
-│   │   ├── index.go            # File indexing
-│   │   ├── local.go            # Local source
-│   │   ├── s3.go               # S3 source
-│   │   └── source.go           # Interface
-│   ├── storage/
-│   │   ├── gcs.go              # GCS storage
-│   │   ├── local.go            # Local storage
-│   │   ├── s3.go               # S3 storage
-│   │   └── store.go            # Interface
-│   ├── tables/
-│   │   ├── checksum.go         # Checksum utils
-│   │   ├── extractor.go        # XDR extraction
-│   │   ├── partition.go        # Partition building
-│   │   └── schema.go           # Parquet schema
-│   └── util/
-│       ├── filesystem.go
-│       ├── hash.go
-│       └── strconv.go
-├── docs/
-│   ├── shaping/                # Shape Up documents
-│   └── DEVELOPER-HANDOFF.md    # This document
-├── config.example.yaml
-├── flake.nix
-├── go.mod
-├── go.sum
-└── README.md
-```
+### Immediate
+
+1. Deploy to staging with real pubnet data
+2. Set up monitoring (watch checkpoint age, PAS events)
+3. Configure alerting for stuck backfills
+
+### Future Enhancements
+
+1. **Prometheus metrics** - ledgers/sec, partition latency, error counts
+2. **Multiple tables** - transactions, operations, etc.
+3. **Live streaming** - gRPC source for real-time tailing
+4. **Web UI** - Progress dashboard
+
+---
+
+## Commits (Cycle 3)
+
+1. `ed8e46f` - Implement Cycle 3 Part 1: PAS Emitter with hash chaining
+2. `4dfcd70` - Add parallel commits infrastructure for improved throughput
+3. `dbf8f4b` - Integrate parallel commits into main copier loop
+4. `fd04f41` - Add CLI flags and config validation
+
+---
+
+## Documentation
+
+- **README.md** - User guide with all features
+- **docs/RUNBOOK.md** - Operational runbook
+- **config.example.yaml** - Reference configuration
+- **docs/shaping/** - Shape Up design documents
 
 ---
 
 ## Contact
 
-For questions about this implementation:
-- Review Shape Up documents in `docs/shaping/`
-- Check README.md for usage
-- Consult PRD v2 in chat history
+For questions:
+- GitHub Issues: https://github.com/withObsrvr/obsrvr-bronze-copier/issues
+- Design docs: `docs/shaping/`

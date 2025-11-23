@@ -5,11 +5,15 @@ The Bronze Copier is Obsrvr's trust foundation - a standalone service that copie
 ## Features
 
 - **Multi-source support**: Read from local filesystem, GCS, or S3-compatible storage (B2, R2, MinIO)
+- **Datastore mode**: Uses Stellar's BufferedStorageBackend for reliable Galexie archive access
 - **Versioned output**: Era and version-aware path structure for protocol upgrade safety
 - **Parquet output**: Efficient columnar format with raw XDR preservation
 - **Checkpointing**: Resume from last committed ledger after crashes
 - **Deterministic**: Same input always produces identical checksums
 - **Manifest files**: Per-partition metadata for verification
+- **Catalog integration**: PostgreSQL metadata tracking with lineage records
+- **PAS (Public Audit Stream)**: Hash-chained audit events for tamper detection
+- **Parallel commits**: Concurrent partition processing for improved throughput
 
 ## Quick Start
 
@@ -36,6 +40,22 @@ go build -o bronze-copier ./cmd/bronze-copier
 ./bronze-copier
 ```
 
+## CLI Usage
+
+```bash
+# Show version
+./bronze-copier -version
+
+# Validate configuration
+./bronze-copier -config config.yaml -validate
+
+# Run with config file
+./bronze-copier -config config.yaml
+
+# Run with environment variables
+./bronze-copier
+```
+
 ## Configuration
 
 Bronze Copier can be configured via YAML file or environment variables.
@@ -49,16 +69,19 @@ cp config.example.yaml config.yaml
 # Edit config.yaml for your deployment
 vim config.yaml
 
-# Run with config file
+# Run with config file (either method)
+./bronze-copier -config config.yaml
+# or
 CONFIG_FILE=config.yaml ./bronze-copier
 ```
 
 ### Environment Variables
 
 ```bash
-# Source configuration
-export SOURCE_MODE=local
-export SOURCE_LOCAL_PATH=./testdata/archive
+# Source configuration (datastore mode - recommended)
+export SOURCE_MODE=datastore
+export SOURCE_DATASTORE_TYPE=GCS
+export SOURCE_DATASTORE_PATH=obsrvr-stellar-ledger-data-pubnet-data/landing/ledgers/pubnet
 
 # Storage configuration
 export STORAGE_BACKEND=local
@@ -72,6 +95,17 @@ export NETWORK=pubnet
 export LEDGER_START=1
 export LEDGER_END=100000
 export PARTITION_SIZE=10000
+
+# Optional: Catalog
+export CATALOG_DSN="postgres://user:pass@localhost/obsrvr"
+
+# Optional: PAS
+export PAS_ENABLED=true
+export PAS_BACKUP_DIR=./pas-backup
+# export PAS_ENDPOINT=https://pas.obsrvr.io/v1/events
+
+# Optional: Performance
+export MAX_IN_FLIGHT_PARTITIONS=4
 
 # Run
 ./bronze-copier
@@ -185,6 +219,80 @@ Bronze Copier automatically saves progress after each partition:
 
 On restart, the copier resumes from the last committed ledger.
 
+## Public Audit Stream (PAS)
+
+Bronze Copier emits hash-chained audit events for tamper detection:
+
+```bash
+# Enable PAS with file-only backup
+PAS_ENABLED=true PAS_BACKUP_DIR=./pas-backup ./bronze-copier
+
+# Enable PAS with HTTP endpoint
+PAS_ENABLED=true PAS_ENDPOINT=https://pas.obsrvr.io/v1/events ./bronze-copier
+```
+
+### PAS Event Format (v1.1)
+
+```json
+{
+  "version": "1.1",
+  "event_type": "bronze_partition",
+  "event_id": "pas_evt_86523c519b61de66",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "partition": {
+    "network": "pubnet",
+    "era_id": "pre_p23",
+    "version_label": "v1",
+    "ledger_start": 59950000,
+    "ledger_end": 59959999
+  },
+  "tables": {
+    "ledgers_lcm_raw": {
+      "checksum": "sha256:abc123...",
+      "row_count": 10000,
+      "storage_path": "pubnet/pre_p23/v1/ledgers_lcm_raw/range=59950000-59959999",
+      "byte_size": 524288000
+    }
+  },
+  "producer": {
+    "name": "bronze-copier",
+    "version": "v0.1.0",
+    "git_sha": "abc123"
+  },
+  "chain": {
+    "prev_event_hash": "sha256:previous...",
+    "event_hash": "sha256:current..."
+  }
+}
+```
+
+The `chain.prev_event_hash` links to the previous event, creating a tamper-evident chain.
+
+## Parallel Commits
+
+Enable parallel partition processing for improved throughput:
+
+```bash
+# Process up to 4 partitions concurrently
+MAX_IN_FLIGHT_PARTITIONS=4 ./bronze-copier
+```
+
+Parallel mode processes parquet generation and storage writes concurrently while maintaining sequential PAS emission (required for hash chain integrity).
+
+## Catalog Metadata
+
+Bronze Copier can record partition metadata in PostgreSQL:
+
+```bash
+# Enable catalog tracking
+CATALOG_DSN="postgres://user:pass@localhost/obsrvr" ./bronze-copier
+```
+
+The catalog tracks:
+- Dataset registration (domain, table, version, era)
+- Partition records (checksums, row counts, byte sizes)
+- Lineage information (source type, source location)
+
 ## Protocol Upgrade Handling
 
 Bronze Copier supports running multiple eras/versions concurrently:
@@ -231,25 +339,27 @@ nix run
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Bronze Copier                            │
-│                                                              │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
-│  │   Source    │───▶│  Partition  │───▶│   Storage   │     │
-│  │ (GCS/S3/FS) │    │  Builder    │    │ (GCS/S3/FS) │     │
-│  └─────────────┘    └─────────────┘    └─────────────┘     │
-│         │                  │                  │             │
-│         ▼                  ▼                  ▼             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
-│  │   Decoder   │    │   Parquet   │    │  Manifest   │     │
-│  │  (XDR/zstd) │    │   Writer    │    │   Writer    │     │
-│  └─────────────┘    └─────────────┘    └─────────────┘     │
-│                            │                               │
-│                            ▼                               │
-│                     ┌─────────────┐                        │
-│                     │ Checkpoint  │                        │
-│                     └─────────────┘                        │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            Bronze Copier                                  │
+│                                                                           │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                   │
+│  │   Source    │───▶│  Partition  │───▶│   Storage   │                   │
+│  │ (Datastore) │    │  Builder    │    │ (GCS/S3/FS) │                   │
+│  └─────────────┘    └─────────────┘    └─────────────┘                   │
+│         │                  │                  │                           │
+│         ▼                  ▼                  ▼                           │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                   │
+│  │   Decoder   │    │   Parquet   │    │  Manifest   │                   │
+│  │  (XDR/zstd) │    │   Writer    │    │   Writer    │                   │
+│  └─────────────┘    └─────────────┘    └─────────────┘                   │
+│                            │                                              │
+│              ┌─────────────┼─────────────┬─────────────┐                 │
+│              ▼             ▼             ▼             ▼                 │
+│       ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐           │
+│       │ Checkpoint│ │  Catalog  │ │    PAS    │ │  Parallel │           │
+│       │  (JSON)   │ │(PostgreSQL│ │ (HTTP/FS) │ │ Committer │           │
+│       └───────────┘ └───────────┘ └───────────┘ └───────────┘           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## License
