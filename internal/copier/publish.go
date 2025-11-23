@@ -51,11 +51,12 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 	}
 
 	// Step 2: Check storage for existing partition
+	primaryTable := c.cfg.Bronze.PrimaryTable
 	ref := storage.PartitionRef{
 		Network:      c.cfg.Era.Network,
 		EraID:        c.cfg.Era.EraID,
 		VersionLabel: c.cfg.Era.VersionLabel,
-		Table:        "ledgers_lcm_raw",
+		Table:        primaryTable,
 		LedgerStart:  part.Start,
 		LedgerEnd:    part.End,
 	}
@@ -132,8 +133,8 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 			totalBytes += int64(len(parquetBytes))
 		}
 
-		storagePath := fmt.Sprintf("%s/%s/%s/ledgers_lcm_raw/range=%d-%d",
-			c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, part.Start, part.End)
+		storagePath := fmt.Sprintf("%s/%s/%s/%s/range=%d-%d",
+			c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, primaryTable, part.Start, part.End)
 
 		if err := c.meta.RecordPartition(ctx, metadata.PartitionRecord{
 			DatasetID:       c.datasetID,
@@ -143,6 +144,7 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 			End:             part.End,
 			Checksums:       output.Checksums,
 			RowCounts:       output.RowCounts,
+			PrimaryTable:    primaryTable,
 			ByteSize:        totalBytes,
 			StoragePath:     storagePath,
 			ProducerVersion: fmt.Sprintf("bronze-copier@%s", Version),
@@ -150,7 +152,9 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 			SourceType:      c.cfg.Source.Mode,
 			SourceLocation:  c.sourceLocation(),
 		}); err != nil {
-			// Log but don't fail - metadata is important but not critical
+			if c.cfg.Catalog.Strict {
+				return nil, fmt.Errorf("record metadata (strict mode): %w", err)
+			}
 			log.Warn("failed to record metadata", "error", err)
 		}
 	}
@@ -183,7 +187,10 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 				GitSHA:  GitSHA,
 			},
 		}); err != nil {
-			// PAS failure is serious but not fatal
+			if c.cfg.PAS.Strict {
+				return nil, fmt.Errorf("emit PAS event (strict mode): %w", err)
+			}
+			// PAS failure is serious but not fatal in lenient mode
 			// The partition is already committed - log and continue
 			log.Warn("failed to emit PAS event", "error", err)
 		}
@@ -210,6 +217,7 @@ func (c *Copier) updateCheckpoint(ctx context.Context, part tables.Partition, ou
 		return
 	}
 
+	primaryTable := c.cfg.Bronze.PrimaryTable
 	cp := &checkpoint.Checkpoint{
 		CopierID:            c.cfg.CopierID,
 		Network:             c.cfg.Era.Network,
@@ -219,7 +227,7 @@ func (c *Copier) updateCheckpoint(ctx context.Context, part tables.Partition, ou
 		LastPartition: &checkpoint.PartitionInfo{
 			Start:    part.Start,
 			End:      part.End,
-			Checksum: output.Checksums["ledgers_lcm_raw"],
+			Checksum: output.Checksums[primaryTable],
 		},
 		UpdatedAt: time.Now().UTC(),
 	}

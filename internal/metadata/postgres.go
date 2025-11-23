@@ -133,8 +133,11 @@ func (w *PostgresWriter) RecordPartition(ctx context.Context, rec PartitionRecor
 		totalRowCount += count
 	}
 
-	// Get primary checksum (from ledgers_lcm_raw table)
-	checksum := rec.Checksums["ledgers_lcm_raw"]
+	// Get primary checksum (from configured primary table)
+	checksum := ""
+	if rec.PrimaryTable != "" {
+		checksum = rec.Checksums[rec.PrimaryTable]
+	}
 	if checksum == "" {
 		// Fallback to first available checksum
 		for _, cs := range rec.Checksums {

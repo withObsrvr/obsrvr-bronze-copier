@@ -10,6 +10,7 @@ import (
 type CatalogConfig struct {
 	PostgresDSN string // postgres://user:pass@host:5432/db
 	Namespace   string // e.g., "mainnet"
+	Strict      bool   // If true, catalog failures are hard errors
 }
 
 // Writer records partition metadata to the catalog.
@@ -70,8 +71,9 @@ type PartitionRecord struct {
 	End   uint32
 
 	// Per-table checksums and row counts
-	Checksums map[string]string
-	RowCounts map[string]int64
+	Checksums    map[string]string
+	RowCounts    map[string]int64
+	PrimaryTable string // Primary table for checksum (default: first in Checksums)
 
 	// Metadata
 	ByteSize        int64

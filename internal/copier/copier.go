@@ -252,20 +252,21 @@ func (c *Copier) sourceLocation() string {
 
 // ensureDataset registers the dataset in the catalog and caches the ID.
 func (c *Copier) ensureDataset(ctx context.Context) error {
+	primaryTable := c.cfg.Bronze.PrimaryTable
 	datasetID, err := c.meta.EnsureDataset(ctx, metadata.DatasetInfo{
 		Domain:      "bronze",
-		Dataset:     "ledgers_lcm_raw",
+		Dataset:     primaryTable,
 		Version:     c.cfg.Era.VersionLabel,
 		EraID:       c.cfg.Era.EraID,
 		Network:     c.cfg.Era.Network,
-		Description: "Raw Ledger Close Meta (LCM) data from Stellar network",
+		Description: fmt.Sprintf("Raw %s data from Stellar network", primaryTable),
 	})
 	if err != nil {
 		return err
 	}
 	c.datasetID = datasetID
 	if datasetID > 0 {
-		c.log.Info("registered dataset in catalog", "dataset_id", datasetID)
+		c.log.Info("registered dataset in catalog", "dataset_id", datasetID, "table", primaryTable)
 	}
 	return nil
 }
@@ -359,9 +360,10 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 			totalBytes += int64(len(parquetBytes))
 		}
 
-		// Build storage path (first table as reference)
-		storagePath := fmt.Sprintf("%s/%s/%s/ledgers_lcm_raw/range=%d-%d",
-			c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, part.Start, part.End)
+		// Build storage path (primary table as reference)
+		primaryTable := c.cfg.Bronze.PrimaryTable
+		storagePath := fmt.Sprintf("%s/%s/%s/%s/range=%d-%d",
+			c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, primaryTable, part.Start, part.End)
 
 		if err := c.meta.RecordPartition(ctx, metadata.PartitionRecord{
 			DatasetID:       c.datasetID,
@@ -371,6 +373,7 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 			End:             part.End,
 			Checksums:       output.Checksums,
 			RowCounts:       output.RowCounts,
+			PrimaryTable:    primaryTable,
 			ByteSize:        totalBytes,
 			StoragePath:     storagePath,
 			ProducerVersion: fmt.Sprintf("bronze-copier@%s", Version),
@@ -417,6 +420,7 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 
 	// Update checkpoint
 	if c.checkpoint != nil {
+		primaryTable := c.cfg.Bronze.PrimaryTable
 		cp := &checkpoint.Checkpoint{
 			CopierID:            c.cfg.CopierID,
 			Network:             c.cfg.Era.Network,
@@ -426,7 +430,7 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 			LastPartition: &checkpoint.PartitionInfo{
 				Start:    part.Start,
 				End:      part.End,
-				Checksum: output.Checksums["ledgers_lcm_raw"],
+				Checksum: output.Checksums[primaryTable],
 			},
 			UpdatedAt: time.Now().UTC(),
 		}
@@ -514,8 +518,9 @@ func (c *Copier) recordPartitionMetadata(ctx context.Context, part tables.Partit
 	}
 
 	// Build storage path
-	storagePath := fmt.Sprintf("%s/%s/%s/ledgers_lcm_raw/range=%d-%d",
-		c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, part.Start, part.End)
+	primaryTable := c.cfg.Bronze.PrimaryTable
+	storagePath := fmt.Sprintf("%s/%s/%s/%s/range=%d-%d",
+		c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, primaryTable, part.Start, part.End)
 
 	if err := c.meta.RecordPartition(ctx, metadata.PartitionRecord{
 		DatasetID:       c.datasetID,
@@ -525,6 +530,7 @@ func (c *Copier) recordPartitionMetadata(ctx context.Context, part tables.Partit
 		End:             part.End,
 		Checksums:       output.Checksums,
 		RowCounts:       output.RowCounts,
+		PrimaryTable:    primaryTable,
 		ByteSize:        totalBytes,
 		StoragePath:     storagePath,
 		ProducerVersion: fmt.Sprintf("bronze-copier@%s", Version),
@@ -573,6 +579,7 @@ func (c *Copier) saveCheckpoint(ctx context.Context, part tables.Partition, outp
 		return
 	}
 
+	primaryTable := c.cfg.Bronze.PrimaryTable
 	cp := &checkpoint.Checkpoint{
 		CopierID:            c.cfg.CopierID,
 		Network:             c.cfg.Era.Network,
@@ -582,7 +589,7 @@ func (c *Copier) saveCheckpoint(ctx context.Context, part tables.Partition, outp
 		LastPartition: &checkpoint.PartitionInfo{
 			Start:    part.Start,
 			End:      part.End,
-			Checksum: output.Checksums["ledgers_lcm_raw"],
+			Checksum: output.Checksums[primaryTable],
 		},
 		UpdatedAt: time.Now().UTC(),
 	}

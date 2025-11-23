@@ -44,6 +44,9 @@ type Config struct {
 
 	// Metrics configuration
 	Metrics MetricsConfig `yaml:"metrics"`
+
+	// Bronze-specific configuration
+	Bronze BronzeConfig `yaml:"bronze"`
 }
 
 // LoggingConfig defines logging settings.
@@ -114,6 +117,12 @@ type StorageConfig struct {
 type CatalogConfig struct {
 	PostgresDSN string `yaml:"postgres_dsn"`
 	Namespace   string `yaml:"namespace"` // e.g., "mainnet"
+	Strict      bool   `yaml:"strict"`    // If true, catalog failures are hard errors
+}
+
+// BronzeConfig defines bronze-specific settings.
+type BronzeConfig struct {
+	PrimaryTable string `yaml:"primary_table"` // Primary table for checksums (default: "ledgers_lcm_raw")
 }
 
 // PASConfig defines Public Audit Stream settings.
@@ -121,6 +130,7 @@ type PASConfig struct {
 	Enabled   bool   `yaml:"enabled"`
 	Endpoint  string `yaml:"endpoint"`   // PAS server URL
 	BackupDir string `yaml:"backup_dir"` // Local backup directory for events
+	Strict    bool   `yaml:"strict"`     // If true, PAS emission failures are hard errors
 }
 
 // CheckpointConfig defines checkpoint settings.
@@ -211,11 +221,16 @@ func LoadFromEnv() Config {
 		Catalog: CatalogConfig{
 			PostgresDSN: os.Getenv("CATALOG_DSN"),
 			Namespace:   getenvDefault("CATALOG_NAMESPACE", "mainnet"),
+			Strict:      os.Getenv("CATALOG_STRICT") == "true",
 		},
 		PAS: PASConfig{
 			Enabled:   os.Getenv("PAS_ENABLED") == "true",
 			Endpoint:  os.Getenv("PAS_ENDPOINT"),
 			BackupDir: getenvDefault("PAS_BACKUP_DIR", "./pas-backup"),
+			Strict:    os.Getenv("PAS_STRICT") == "true",
+		},
+		Bronze: BronzeConfig{
+			PrimaryTable: getenvDefault("BRONZE_PRIMARY_TABLE", "ledgers_lcm_raw"),
 		},
 		Checkpoint: CheckpointConfig{
 			Enabled: getenvDefault("CHECKPOINT_ENABLED", "true") == "true",
@@ -292,6 +307,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Metrics.Address == "" {
 		cfg.Metrics.Address = ":9090"
+	}
+	if cfg.Bronze.PrimaryTable == "" {
+		cfg.Bronze.PrimaryTable = "ledgers_lcm_raw"
 	}
 }
 

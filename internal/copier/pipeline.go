@@ -285,7 +285,7 @@ doneStreaming:
 	buildID := uuid.New().String()
 	builtPart := &BuiltPartition{
 		Range:        r,
-		Dataset:      "ledgers_lcm_raw",
+		Dataset:      p.copier.cfg.Bronze.PrimaryTable,
 		EraID:        p.copier.cfg.Era.EraID,
 		VersionLabel: p.copier.cfg.Era.VersionLabel,
 		Network:      p.copier.cfg.Era.Network,
@@ -308,8 +308,9 @@ doneStreaming:
 	builtPart.RowCount = totalRows
 	builtPart.ByteSizes = byteSizes
 
-	// Use primary checksum (ledgers_lcm_raw)
-	if cs, ok := output.Checksums["ledgers_lcm_raw"]; ok {
+	// Use primary checksum (from config)
+	primaryTable := p.copier.cfg.Bronze.PrimaryTable
+	if cs, ok := output.Checksums[primaryTable]; ok {
 		builtPart.DataHash = cs
 	}
 
@@ -462,25 +463,35 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 	if c.datasetID > 0 {
 		lineageRec := buildLineageRecord(c, part, storageURI, prevHash)
 		if err := c.meta.InsertLineage(ctx, lineageRec); err != nil {
+			if c.cfg.Catalog.Strict {
+				return fmt.Errorf("insert lineage (strict mode): %w", err)
+			}
 			log.Warn("failed to insert lineage", "error", err)
 		}
 
 		// Record quality pass
 		if err := c.meta.InsertQuality(ctx, buildQualityRecord(c.datasetID, part, true, "")); err != nil {
+			if c.cfg.Catalog.Strict {
+				return fmt.Errorf("insert quality (strict mode): %w", err)
+			}
 			log.Warn("failed to insert quality", "error", err)
 		}
 	}
 
 	// Step 8: Emit PAS event
 	if c.cfg.PAS.Enabled {
+		primaryTable := c.cfg.Bronze.PrimaryTable
 		if err := c.emitPASEvent(ctx, tables.Partition{
 			Start: part.Range.Start,
 			End:   part.Range.End,
 		}, &tables.ParquetOutput{
-			Parquets:  map[string][]byte{"ledgers_lcm_raw": part.ParquetBytes},
+			Parquets:  map[string][]byte{primaryTable: part.ParquetBytes},
 			Checksums: part.Checksums,
 			RowCounts: part.RowCounts,
 		}); err != nil {
+			if c.cfg.PAS.Strict {
+				return fmt.Errorf("emit PAS event (strict mode): %w", err)
+			}
 			log.Warn("failed to emit PAS event", "error", err)
 		}
 	}
