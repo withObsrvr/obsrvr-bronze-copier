@@ -3,7 +3,6 @@ package copier
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/checkpoint"
@@ -35,17 +34,18 @@ type PublishResult struct {
 //
 // If any step fails, earlier steps should be rolled back or idempotent.
 func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*PublishResult, error) {
-	log.Printf("[publish] starting partition %d-%d", part.Start, part.End)
+	log := c.log.With("ledger_start", part.Start, "ledger_end", part.End)
+	log.Debug("starting partition publish")
 	startTime := time.Now()
 
 	// Step 1: Idempotency check - skip if already committed
 	if c.datasetID > 0 {
 		exists, err := c.meta.PartitionExists(ctx, c.datasetID, part.Start, part.End)
 		if err != nil {
-			log.Printf("[publish] warning: idempotency check failed: %v", err)
+			log.Warn("idempotency check failed", "error", err)
 			// Continue anyway - we'll catch duplicates at storage level
 		} else if exists {
-			log.Printf("[publish] skipping partition %d-%d (already committed)", part.Start, part.End)
+			log.Info("skipping partition (already committed)")
 			return nil, ErrPartitionExists
 		}
 	}
@@ -61,7 +61,7 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 	}
 
 	if exists, _ := c.store.Exists(ctx, ref); exists && !c.cfg.Era.AllowOverwrite {
-		log.Printf("[publish] skipping partition %d-%d (exists in storage)", part.Start, part.End)
+		log.Info("skipping partition (exists in storage)")
 		return nil, ErrPartitionExists
 	}
 
@@ -117,8 +117,12 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 			return nil, fmt.Errorf("write manifest %s: %w", tableName, err)
 		}
 
-		log.Printf("[publish] wrote %s: %d rows, %d bytes, checksum=%s",
-			tableName, output.RowCounts[tableName], len(parquetBytes), output.Checksums[tableName])
+		log.Debug("wrote table",
+			"table", tableName,
+			"rows", output.RowCounts[tableName],
+			"bytes", len(parquetBytes),
+			"checksum", output.Checksums[tableName],
+		)
 	}
 
 	// Step 6: Record in metadata catalog (lineage)
@@ -147,7 +151,7 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 			SourceLocation:  c.sourceLocation(),
 		}); err != nil {
 			// Log but don't fail - metadata is important but not critical
-			log.Printf("[publish] warning: failed to record metadata: %v", err)
+			log.Warn("failed to record metadata", "error", err)
 		}
 	}
 
@@ -181,7 +185,7 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 		}); err != nil {
 			// PAS failure is serious but not fatal
 			// The partition is already committed - log and continue
-			log.Printf("[publish] warning: failed to emit PAS event: %v", err)
+			log.Warn("failed to emit PAS event", "error", err)
 		}
 	}
 
@@ -190,7 +194,7 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 	c.updateCheckpoint(ctx, part, output)
 
 	elapsed := time.Since(startTime)
-	log.Printf("[publish] completed partition %d-%d in %v", part.Start, part.End, elapsed)
+	log.Info("completed partition publish", "duration", elapsed.String())
 
 	return &PublishResult{
 		Part:       part,
@@ -220,7 +224,7 @@ func (c *Copier) updateCheckpoint(ctx context.Context, part tables.Partition, ou
 		UpdatedAt: time.Now().UTC(),
 	}
 	if err := c.checkpoint.Save(ctx, cp); err != nil {
-		log.Printf("[publish] warning: failed to save checkpoint: %v", err)
+		c.log.Warn("failed to save checkpoint", "error", err)
 	}
 }
 

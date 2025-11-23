@@ -3,11 +3,12 @@ package copier
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/logging"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/source"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/tables"
 )
@@ -21,6 +22,7 @@ type Pipeline struct {
 	queueSize   int
 	maxRetry    int
 	backoffMs   int
+	log         *slog.Logger
 
 	workQueue   chan PartitionTask
 	resultChan  chan PartitionResult
@@ -48,6 +50,7 @@ func NewPipeline(c *Copier, workers, queueSize, maxRetry, backoffMs int) *Pipeli
 		queueSize:  queueSize,
 		maxRetry:   maxRetry,
 		backoffMs:  backoffMs,
+		log:        slog.With("component", "pipeline"),
 		workQueue:  make(chan PartitionTask, queueSize),
 		resultChan: make(chan PartitionResult, queueSize),
 	}
@@ -60,7 +63,7 @@ func (p *Pipeline) RunBackfill(ctx context.Context, start, end uint32) error {
 		return nil
 	}
 
-	log.Printf("[pipeline] starting backfill: %d partitions, %d workers", len(ranges), p.workers)
+	p.log.Info("starting backfill", "partitions", len(ranges), "workers", p.workers)
 
 	// Start worker pool
 	for i := 0; i < p.workers; i++ {
@@ -155,8 +158,14 @@ func (p *Pipeline) workerLoop(ctx context.Context, workerID int) {
 // processTask builds a partition and uploads to storage.
 // Does NOT finalize or commit - that's the sequencer's job.
 func (p *Pipeline) processTask(ctx context.Context, workerID int, task PartitionTask) PartitionResult {
-	log.Printf("[worker:%d] processing range [%d-%d] (attempt %d)",
-		workerID, task.Range.Start, task.Range.End, task.Attempt+1)
+	correlationID := logging.GenerateCorrelationID()
+	log := logging.WorkerLogger(workerID).With(
+		"correlation_id", correlationID,
+		"ledger_start", task.Range.Start,
+		"ledger_end", task.Range.End,
+	)
+
+	log.Info("processing partition", "attempt", task.Attempt+1)
 
 	startTime := time.Now()
 
@@ -165,8 +174,7 @@ func (p *Pipeline) processTask(ctx context.Context, workerID int, task Partition
 	if err != nil {
 		// Retry logic
 		if task.Attempt < task.MaxRetry-1 {
-			log.Printf("[worker:%d] retrying range [%d-%d] after error: %v",
-				workerID, task.Range.Start, task.Range.End, err)
+			log.Warn("partition build failed, retrying", "error", err)
 
 			// Exponential backoff
 			backoff := time.Duration(p.backoffMs*(1<<task.Attempt)) * time.Millisecond
@@ -187,8 +195,7 @@ func (p *Pipeline) processTask(ctx context.Context, workerID int, task Partition
 	}
 
 	elapsed := time.Since(startTime)
-	log.Printf("[worker:%d] built partition [%d-%d] in %v (%d rows)",
-		workerID, task.Range.Start, task.Range.End, elapsed, part.RowCount)
+	log.Info("partition built", "duration_ms", elapsed.Milliseconds(), "rows", part.RowCount)
 
 	return PartitionResult{
 		Task:      task,
@@ -348,8 +355,11 @@ func (p *Pipeline) sequencerLoop(ctx context.Context, expected []LedgerRange) er
 				// Progress log
 				elapsed := time.Since(startTime)
 				rate := float64(totalCommitted) / elapsed.Seconds()
-				log.Printf("[sequencer] committed %d/%d partitions (%.2f/sec)",
-					totalCommitted, len(expected), rate)
+				p.log.Info("sequencer progress",
+					"committed", totalCommitted,
+					"total", len(expected),
+					"rate_per_sec", fmt.Sprintf("%.2f", rate),
+				)
 			}
 		}
 	}
@@ -360,16 +370,17 @@ func (p *Pipeline) sequencerLoop(ctx context.Context, expected []LedgerRange) er
 // commitPartition writes a built partition to storage and commits metadata/PAS.
 func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) error {
 	c := p.copier
+	log := p.log.With("ledger_start", part.Range.Start, "ledger_end", part.Range.End)
 
-	log.Printf("[sequencer] committing partition [%d-%d]", part.Range.Start, part.Range.End)
+	log.Debug("committing partition")
 
 	// Step 1: Idempotency check
 	if c.datasetID > 0 {
 		exists, err := c.meta.PartitionExists(ctx, c.datasetID, part.Range.Start, part.Range.End)
 		if err != nil {
-			log.Printf("[sequencer] warning: idempotency check failed: %v", err)
+			log.Warn("idempotency check failed", "error", err)
 		} else if exists {
-			log.Printf("[sequencer] skipping partition [%d-%d] (already committed)", part.Range.Start, part.Range.End)
+			log.Info("skipping partition (already committed)")
 			return nil
 		}
 	}
@@ -379,7 +390,7 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 
 	// Step 3: Check storage existence
 	if exists, _ := c.store.Exists(ctx, ref); exists && !c.cfg.Era.AllowOverwrite {
-		log.Printf("[sequencer] skipping partition [%d-%d] (exists in storage)", part.Range.Start, part.Range.End)
+		log.Info("skipping partition (exists in storage)")
 		return nil
 	}
 
@@ -403,7 +414,7 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 	if c.datasetID > 0 {
 		prev, err := c.meta.GetLastLineage(ctx, c.datasetID)
 		if err != nil {
-			log.Printf("[sequencer] warning: failed to get last lineage: %v", err)
+			log.Warn("failed to get last lineage", "error", err)
 		} else if prev != nil {
 			prevHash = prev.Checksum
 		}
@@ -413,12 +424,12 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 	if c.datasetID > 0 {
 		lineageRec := buildLineageRecord(c, part, storageURI, prevHash)
 		if err := c.meta.InsertLineage(ctx, lineageRec); err != nil {
-			log.Printf("[sequencer] warning: failed to insert lineage: %v", err)
+			log.Warn("failed to insert lineage", "error", err)
 		}
 
 		// Record quality pass
 		if err := c.meta.InsertQuality(ctx, buildQualityRecord(c.datasetID, part, true, "")); err != nil {
-			log.Printf("[sequencer] warning: failed to insert quality: %v", err)
+			log.Warn("failed to insert quality", "error", err)
 		}
 	}
 
@@ -432,7 +443,7 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 			Checksums: part.Checksums,
 			RowCounts: part.RowCounts,
 		}); err != nil {
-			log.Printf("[sequencer] warning: failed to emit PAS event: %v", err)
+			log.Warn("failed to emit PAS event", "error", err)
 		}
 	}
 
@@ -444,8 +455,7 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 		Checksums: part.Checksums,
 	})
 
-	log.Printf("[sequencer] committed partition [%d-%d] hash=%s prev=%s",
-		part.Range.Start, part.Range.End, part.DataHash, prevHash)
+	log.Info("committed partition", "hash", part.DataHash, "prev_hash", prevHash)
 
 	return nil
 }

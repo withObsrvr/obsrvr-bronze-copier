@@ -34,6 +34,15 @@ type Config struct {
 
 	// Performance configuration
 	Perf PerfConfig `yaml:"perf"`
+
+	// Logging configuration
+	Logging LoggingConfig `yaml:"logging"`
+}
+
+// LoggingConfig defines logging settings.
+type LoggingConfig struct {
+	Format string `yaml:"format"` // "json" | "text"
+	Level  string `yaml:"level"`  // "debug" | "info" | "warn" | "error"
 }
 
 // EraConfig defines the era and version being processed.
@@ -202,6 +211,10 @@ func LoadFromEnv() Config {
 		Perf: PerfConfig{
 			MaxInFlightPartitions: parseInt(getenvDefault("MAX_IN_FLIGHT_PARTITIONS", "4")),
 		},
+		Logging: LoggingConfig{
+			Format: getenvDefault("LOG_FORMAT", "text"),
+			Level:  getenvDefault("LOG_LEVEL", "info"),
+		},
 	}
 
 	return cfg
@@ -253,6 +266,12 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Perf.RetryBackoffMs == 0 {
 		cfg.Perf.RetryBackoffMs = 1000
+	}
+	if cfg.Logging.Format == "" {
+		cfg.Logging.Format = "text"
+	}
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
 	}
 }
 

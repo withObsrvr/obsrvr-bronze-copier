@@ -3,7 +3,7 @@ package copier
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/tables"
@@ -84,8 +84,14 @@ func (pc *ParallelCommitter) CommitAsync(ctx context.Context, part tables.Partit
 // parquet generation, storage write, catalog write.
 // PAS emission is handled separately to maintain ordering.
 func (pc *ParallelCommitter) commitPartitionParallel(ctx context.Context, part tables.Partition) (*tables.ParquetOutput, error) {
-	log.Printf("[partition:parallel] processing era=%s v=%s range=%d-%d (%d ledgers)",
-		pc.copier.cfg.Era.EraID, pc.copier.cfg.Era.VersionLabel, part.Start, part.End, len(part.Ledgers))
+	log := slog.With(
+		"component", "parallel",
+		"era_id", pc.copier.cfg.Era.EraID,
+		"version", pc.copier.cfg.Era.VersionLabel,
+		"ledger_start", part.Start,
+		"ledger_end", part.End,
+	)
+	log.Debug("processing partition", "ledger_count", len(part.Ledgers))
 
 	// Generate parquet (CPU-bound, safe to parallelize)
 	parquetCfg := tables.ParquetConfig{

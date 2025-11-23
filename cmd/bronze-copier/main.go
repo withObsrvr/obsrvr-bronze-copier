@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/config"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/copier"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/logging"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/source"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/storage"
 )
@@ -31,39 +32,58 @@ func main() {
 		os.Exit(0)
 	}
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[main] Bronze Copier %s (%s)", copier.Version, copier.GitSHA)
-
-	// Load configuration
+	// Load configuration first (need logging config)
 	var cfg config.Config
 	var err error
 
 	if *configFile != "" {
 		cfg, err = config.LoadFromFile(*configFile)
 		if err != nil {
-			log.Fatalf("[config] failed to load config file: %v", err)
+			fmt.Fprintf(os.Stderr, "config: failed to load config file: %v\n", err)
+			os.Exit(1)
 		}
-		log.Printf("[config] loaded from %s", *configFile)
 	} else if envConfig := os.Getenv("CONFIG_FILE"); envConfig != "" {
 		cfg, err = config.LoadFromFile(envConfig)
 		if err != nil {
-			log.Fatalf("[config] failed to load config file: %v", err)
+			fmt.Fprintf(os.Stderr, "config: failed to load config file: %v\n", err)
+			os.Exit(1)
 		}
-		log.Printf("[config] loaded from %s (via CONFIG_FILE)", envConfig)
 	} else {
 		cfg = config.LoadFromEnv()
-		log.Printf("[config] loaded from environment variables")
 	}
+
+	// Initialize structured logging
+	logging.Setup(logging.Config{
+		Format: cfg.Logging.Format,
+		Level:  cfg.Logging.Level,
+	})
+
+	log := slog.With("component", "main")
+	log.Info("bronze copier starting",
+		"version", copier.Version,
+		"git_sha", copier.GitSHA,
+		"log_format", cfg.Logging.Format,
+		"log_level", cfg.Logging.Level,
+	)
 
 	// Validate configuration
 	if err := config.Validate(cfg); err != nil {
-		log.Fatalf("[config] validation failed: %v", err)
+		log.Error("configuration validation failed", "error", err)
+		os.Exit(1)
 	}
 
 	if *validateOnly {
-		log.Println("[config] configuration is valid")
+		log.Info("configuration is valid")
 		os.Exit(0)
 	}
+
+	log.Info("configuration loaded",
+		"source_mode", cfg.Source.Mode,
+		"storage_backend", cfg.Storage.Backend,
+		"network", cfg.Era.Network,
+		"era_id", cfg.Era.EraID,
+		"version_label", cfg.Era.VersionLabel,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -73,7 +93,7 @@ func main() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-ch
-		log.Printf("[shutdown] received signal: %v", sig)
+		log.Warn("shutdown signal received", "signal", sig.String())
 		cancel()
 	}()
 
@@ -93,7 +113,8 @@ func main() {
 
 	src, err := source.NewLedgerSource(srcCfg)
 	if err != nil {
-		log.Fatalf("[main] failed to create source: %v", err)
+		log.Error("failed to create source", "error", err)
+		os.Exit(1)
 	}
 	defer src.Close()
 
@@ -110,7 +131,8 @@ func main() {
 
 	store, err := storage.NewBronzeStore(storeCfg)
 	if err != nil {
-		log.Fatalf("[main] failed to create storage: %v", err)
+		log.Error("failed to create storage", "error", err)
+		os.Exit(1)
 	}
 	defer store.Close()
 
@@ -119,12 +141,13 @@ func main() {
 
 	if err := c.Run(ctx); err != nil {
 		if ctx.Err() != nil {
-			log.Printf("[main] shutdown complete")
+			log.Info("shutdown complete")
 		} else {
-			log.Fatalf("[main] copier failed: %v", err)
+			log.Error("copier failed", "error", err)
+			os.Exit(1)
 		}
 	}
 
-	log.Println("[main] bronze copier stopped cleanly")
+	log.Info("bronze copier stopped cleanly")
 	time.Sleep(100 * time.Millisecond)
 }

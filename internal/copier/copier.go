@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/checkpoint"
@@ -31,18 +31,21 @@ type Copier struct {
 	pas        pas.Emitter
 	checkpoint checkpoint.Manager
 	builder    *tables.PartitionBuilder
-	datasetID  int64 // cached dataset ID from catalog
+	datasetID  int64       // cached dataset ID from catalog
+	log        *slog.Logger // structured logger
 }
 
 // New creates a new Bronze Copier.
 func New(cfg config.Config, src source.LedgerSource, store storage.BronzeStore) *Copier {
+	log := slog.With("component", "copier")
+
 	// Create checkpoint manager
 	cpMgr, err := checkpoint.NewManager(checkpoint.Config{
 		Enabled: cfg.Checkpoint.Enabled,
 		Dir:     cfg.Checkpoint.Dir,
 	})
 	if err != nil {
-		log.Printf("[copier] warning: failed to create checkpoint manager: %v", err)
+		log.Warn("failed to create checkpoint manager", "error", err)
 		cpMgr = nil
 	}
 
@@ -54,6 +57,7 @@ func New(cfg config.Config, src source.LedgerSource, store storage.BronzeStore) 
 		pas:        pas.NewEmitter(cfg.PAS),
 		checkpoint: cpMgr,
 		builder:    tables.NewPartitionBuilder(cfg.Era.PartitionSize),
+		log:        log,
 	}
 }
 
@@ -61,7 +65,7 @@ func New(cfg config.Config, src source.LedgerSource, store storage.BronzeStore) 
 func (c *Copier) Run(ctx context.Context) error {
 	// Register dataset with catalog and get ID for lineage records
 	if err := c.ensureDataset(ctx); err != nil {
-		log.Printf("[copier] warning: failed to ensure dataset in catalog: %v", err)
+		c.log.Warn("failed to ensure dataset in catalog", "error", err)
 		// Continue without catalog - it's optional
 	}
 
@@ -78,9 +82,9 @@ func (c *Copier) Run(ctx context.Context) error {
 				cp.EraID == c.cfg.Era.EraID &&
 				cp.VersionLabel == c.cfg.Era.VersionLabel {
 				startLedger = cp.LastCommittedLedger + 1
-				log.Printf("[copier] resuming from checkpoint: ledger %d", startLedger)
+				c.log.Info("resuming from checkpoint", "start_ledger", startLedger)
 			} else {
-				log.Printf("[copier] checkpoint doesn't match config, starting fresh")
+				c.log.Info("checkpoint doesn't match config, starting fresh")
 			}
 		}
 	}
@@ -101,9 +105,14 @@ func (c *Copier) Run(ctx context.Context) error {
 
 // runSequential runs the copier in sequential mode (one partition at a time).
 func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
-	log.Printf("[copier] starting (sequential) era=%s version=%s network=%s range=%d-%d partition_size=%d",
-		c.cfg.Era.EraID, c.cfg.Era.VersionLabel, c.cfg.Era.Network,
-		startLedger, c.cfg.Era.LedgerEnd, c.cfg.Era.PartitionSize)
+	c.log.Info("starting sequential mode",
+		"era_id", c.cfg.Era.EraID,
+		"version", c.cfg.Era.VersionLabel,
+		"network", c.cfg.Era.Network,
+		"ledger_start", startLedger,
+		"ledger_end", c.cfg.Era.LedgerEnd,
+		"partition_size", c.cfg.Era.PartitionSize,
+	)
 
 	// Start streaming ledgers
 	ledgersCh, errCh := c.src.Stream(ctx, startLedger, c.cfg.Era.LedgerEnd)
@@ -118,9 +127,9 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 		case <-ctx.Done():
 			// Flush any remaining ledgers
 			if remaining := c.builder.FlushRemaining(); remaining != nil {
-				log.Printf("[copier] flushing remaining %d ledgers on shutdown", len(remaining.Ledgers))
+				c.log.Info("flushing remaining ledgers on shutdown", "count", len(remaining.Ledgers))
 				if _, err := c.publishPartition(ctx, *remaining); err != nil && !errors.Is(err, ErrPartitionExists) {
-					log.Printf("[copier] error flushing remaining: %v", err)
+					c.log.Error("error flushing remaining", "error", err)
 				}
 			}
 			return c.src.Close()
@@ -135,7 +144,7 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 			if !ok {
 				// Stream complete - flush remaining
 				if remaining := c.builder.FlushRemaining(); remaining != nil {
-					log.Printf("[copier] flushing final partition with %d ledgers", len(remaining.Ledgers))
+					c.log.Info("flushing final partition", "ledger_count", len(remaining.Ledgers))
 					if _, err := c.publishPartition(ctx, *remaining); err != nil {
 						if errors.Is(err, ErrPartitionExists) {
 							skippedCount++
@@ -149,8 +158,13 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 
 				elapsed := time.Since(startTime)
 				rate := float64(ledgerCount) / elapsed.Seconds()
-				log.Printf("[copier] complete: %d ledgers, %d partitions published, %d skipped, %.2f ledgers/sec",
-					ledgerCount, partitionCount, skippedCount, rate)
+				c.log.Info("sequential run complete",
+					"ledgers", ledgerCount,
+					"partitions", partitionCount,
+					"skipped", skippedCount,
+					"rate_per_sec", fmt.Sprintf("%.2f", rate),
+					"duration", elapsed.String(),
+				)
 				return nil
 			}
 
@@ -183,8 +197,12 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 				// Log progress
 				elapsed := time.Since(startTime)
 				rate := float64(ledgerCount) / elapsed.Seconds()
-				log.Printf("[copier] progress: %d ledgers, %d partitions, %d skipped, %.2f ledgers/sec",
-					ledgerCount, partitionCount, skippedCount, rate)
+				c.log.Info("progress",
+					"ledgers", ledgerCount,
+					"partitions", partitionCount,
+					"skipped", skippedCount,
+					"rate_per_sec", fmt.Sprintf("%.2f", rate),
+				)
 			}
 		}
 	}
@@ -194,9 +212,15 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 // Uses dispatcher → workers → sequencer pattern for parallel processing
 // with ordered commits.
 func (c *Copier) runParallel(ctx context.Context, startLedger uint32, maxInFlight int) error {
-	log.Printf("[copier] starting (pipeline, workers=%d) era=%s version=%s network=%s range=%d-%d partition_size=%d",
-		c.cfg.Perf.Workers, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, c.cfg.Era.Network,
-		startLedger, c.cfg.Era.LedgerEnd, c.cfg.Era.PartitionSize)
+	c.log.Info("starting pipeline mode",
+		"workers", c.cfg.Perf.Workers,
+		"era_id", c.cfg.Era.EraID,
+		"version", c.cfg.Era.VersionLabel,
+		"network", c.cfg.Era.Network,
+		"ledger_start", startLedger,
+		"ledger_end", c.cfg.Era.LedgerEnd,
+		"partition_size", c.cfg.Era.PartitionSize,
+	)
 
 	// Use the new pipeline architecture
 	pipeline := NewPipeline(
@@ -241,15 +265,20 @@ func (c *Copier) ensureDataset(ctx context.Context) error {
 	}
 	c.datasetID = datasetID
 	if datasetID > 0 {
-		log.Printf("[copier] registered dataset in catalog: id=%d", datasetID)
+		c.log.Info("registered dataset in catalog", "dataset_id", datasetID)
 	}
 	return nil
 }
 
 // commitPartition writes a partition to storage with all metadata.
 func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) error {
-	log.Printf("[partition] processing era=%s v=%s range=%d-%d (%d ledgers)",
-		c.cfg.Era.EraID, c.cfg.Era.VersionLabel, part.Start, part.End, len(part.Ledgers))
+	c.log.Debug("processing partition",
+		"era_id", c.cfg.Era.EraID,
+		"version", c.cfg.Era.VersionLabel,
+		"ledger_start", part.Start,
+		"ledger_end", part.End,
+		"ledger_count", len(part.Ledgers),
+	)
 
 	// Generate parquet
 	parquetCfg := tables.ParquetConfig{
@@ -314,8 +343,12 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 			return fmt.Errorf("write manifest %s: %w", tableName, err)
 		}
 
-		log.Printf("[partition] wrote %s: %d rows, %d bytes, checksum=%s",
-			tableName, output.RowCounts[tableName], len(parquetBytes), output.Checksums[tableName])
+		c.log.Debug("wrote table",
+			"table", tableName,
+			"rows", output.RowCounts[tableName],
+			"bytes", len(parquetBytes),
+			"checksum", output.Checksums[tableName],
+		)
 	}
 
 	// Record in metadata catalog
@@ -345,7 +378,7 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 			SourceType:      c.cfg.Source.Mode,
 			SourceLocation:  c.sourceLocation(),
 		}); err != nil {
-			log.Printf("[partition] warning: failed to record metadata: %v", err)
+			c.log.Warn("failed to record metadata", "error", err)
 			// Don't fail the partition for metadata errors
 		}
 	}
@@ -377,7 +410,7 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 				GitSHA:  GitSHA,
 			},
 		}); err != nil {
-			log.Printf("[partition] warning: failed to emit PAS event: %v", err)
+			c.log.Warn("failed to emit PAS event", "error", err)
 			// Don't fail the partition for PAS errors (for now)
 		}
 	}
@@ -398,7 +431,7 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 			UpdatedAt: time.Now().UTC(),
 		}
 		if err := c.checkpoint.Save(ctx, cp); err != nil {
-			log.Printf("[partition] warning: failed to save checkpoint: %v", err)
+			c.log.Warn("failed to save checkpoint", "error", err)
 		}
 	}
 
@@ -457,8 +490,12 @@ func (c *Copier) writePartitionToStorage(ctx context.Context, part tables.Partit
 			return fmt.Errorf("write manifest %s: %w", tableName, err)
 		}
 
-		log.Printf("[partition] wrote %s: %d rows, %d bytes, checksum=%s",
-			tableName, output.RowCounts[tableName], len(parquetBytes), output.Checksums[tableName])
+		c.log.Debug("wrote table",
+			"table", tableName,
+			"rows", output.RowCounts[tableName],
+			"bytes", len(parquetBytes),
+			"checksum", output.Checksums[tableName],
+		)
 	}
 	return nil
 }
@@ -495,7 +532,7 @@ func (c *Copier) recordPartitionMetadata(ctx context.Context, part tables.Partit
 		SourceType:      c.cfg.Source.Mode,
 		SourceLocation:  c.sourceLocation(),
 	}); err != nil {
-		log.Printf("[partition] warning: failed to record metadata: %v", err)
+		c.log.Warn("failed to record metadata", "error", err)
 	}
 }
 
@@ -550,6 +587,6 @@ func (c *Copier) saveCheckpoint(ctx context.Context, part tables.Partition, outp
 		UpdatedAt: time.Now().UTC(),
 	}
 	if err := c.checkpoint.Save(ctx, cp); err != nil {
-		log.Printf("[partition] warning: failed to save checkpoint: %v", err)
+		c.log.Warn("failed to save checkpoint", "error", err)
 	}
 }
