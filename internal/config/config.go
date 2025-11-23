@@ -14,8 +14,12 @@ type Config struct {
 	// Copier identification
 	CopierID string `yaml:"copier_id"`
 
-	// Era configuration
+	// Era configuration (single era mode - backwards compatible)
 	Era EraConfig `yaml:"era"`
+
+	// Multi-era configuration (optional, takes precedence over Era if set)
+	Eras       []EraConfig `yaml:"eras"`
+	ActiveEras []string    `yaml:"active_eras"` // Which eras to process (empty = all)
 
 	// Source configuration
 	Source SourceConfig `yaml:"source"`
@@ -379,4 +383,20 @@ func Validate(cfg Config) error {
 	}
 
 	return nil
+}
+
+// GetEffectiveEras returns the list of era configurations to use.
+// If Eras is configured, it returns those; otherwise, it returns a single-element
+// slice containing Era (for backwards compatibility).
+func (cfg Config) GetEffectiveEras() []EraConfig {
+	if len(cfg.Eras) > 0 {
+		return cfg.Eras
+	}
+	// Backwards compatibility: use single Era config
+	return []EraConfig{cfg.Era}
+}
+
+// IsMultiEra returns true if multiple eras are configured.
+func (cfg Config) IsMultiEra() bool {
+	return len(cfg.Eras) > 1
 }
