@@ -1,6 +1,10 @@
 package pas
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
 	"time"
 )
 
@@ -50,4 +54,55 @@ type ChainInfo struct {
 // ChainKey returns the unique key for this partition's chain.
 func (p PartitionInfo) ChainKey() string {
 	return p.Network + "/" + p.EraID + "/" + p.VersionLabel
+}
+
+// ComputeEventHash computes the SHA256 hash for this event.
+// The hash is computed over a deterministic canonical representation:
+//
+//	SHA256(ledger_start|ledger_end|prev_event_hash|sorted_table_checksums)
+//
+// This creates a tamper-evident chain where any modification to the
+// event's content will result in a different hash.
+func (e *PASEvent) ComputeEventHash() string {
+	h := sha256.New()
+
+	// Write partition range (deterministic ordering)
+	h.Write([]byte(fmt.Sprintf("%d|%d|", e.Partition.LedgerStart, e.Partition.LedgerEnd)))
+
+	// Write prev_event_hash (empty string if first in chain)
+	h.Write([]byte(e.Chain.PrevEventHash))
+	h.Write([]byte("|"))
+
+	// Write network/era/version for chain isolation
+	h.Write([]byte(e.Partition.Network))
+	h.Write([]byte("|"))
+	h.Write([]byte(e.Partition.EraID))
+	h.Write([]byte("|"))
+	h.Write([]byte(e.Partition.VersionLabel))
+	h.Write([]byte("|"))
+
+	// Write table checksums in sorted order for determinism
+	tableNames := make([]string, 0, len(e.Tables))
+	for name := range e.Tables {
+		tableNames = append(tableNames, name)
+	}
+	sort.Strings(tableNames)
+
+	for _, name := range tableNames {
+		table := e.Tables[name]
+		h.Write([]byte(name))
+		h.Write([]byte(":"))
+		h.Write([]byte(table.Checksum))
+		h.Write([]byte("|"))
+	}
+
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// SetChainHashes sets the prev_event_hash and computes the event_hash.
+// This should be called right before emission to ensure the hash chain
+// is properly maintained.
+func (e *PASEvent) SetChainHashes(prevEventHash string) {
+	e.Chain.PrevEventHash = prevEventHash
+	e.Chain.EventHash = e.ComputeEventHash()
 }

@@ -21,11 +21,21 @@ type Event struct {
 	ByteSizes    map[string]int64
 	StoragePaths map[string]string
 	Producer     ProducerInfo
+
+	// Hash chaining fields
+	PrevEventHash string // Hash of the previous event in the chain (empty for first)
 }
 
 // Emitter is the interface for PAS event emission.
 type Emitter interface {
-	EmitPartition(ctx context.Context, evt Event) error
+	// EmitPartition emits a PAS event and returns the computed event hash.
+	// The event hash should be passed as PrevEventHash in the next event.
+	EmitPartition(ctx context.Context, evt Event) (eventHash string, err error)
+
+	// GetLastEventHash returns the hash of the last emitted event.
+	// Returns empty string if no events have been emitted yet.
+	GetLastEventHash() string
+
 	Close() error
 }
 
@@ -61,35 +71,53 @@ func createFileOnlyEmitter(cfg config.PASConfig) Emitter {
 	return &fileOnlyEmitterWrapper{emitter: emitter}
 }
 
-// httpEmitterWrapper adapts HTTPEmitter to the Emitter interface.
+// httpEmitterWrapper adapts HTTPEmitter to the Emitter interface with hash chaining.
 type httpEmitterWrapper struct {
-	emitter *HTTPEmitter
+	emitter       *HTTPEmitter
+	lastEventHash string
 }
 
-func (w *httpEmitterWrapper) EmitPartition(ctx context.Context, evt Event) error {
+func (w *httpEmitterWrapper) EmitPartition(ctx context.Context, evt Event) (string, error) {
 	pasEvent := convertToPASEvent(evt)
-	return w.emitter.Emit(ctx, &pasEvent)
+	if err := w.emitter.Emit(ctx, &pasEvent); err != nil {
+		return "", err
+	}
+	w.lastEventHash = pasEvent.Chain.EventHash
+	return pasEvent.Chain.EventHash, nil
+}
+
+func (w *httpEmitterWrapper) GetLastEventHash() string {
+	return w.lastEventHash
 }
 
 func (w *httpEmitterWrapper) Close() error {
 	return w.emitter.Close()
 }
 
-// fileOnlyEmitterWrapper adapts FileOnlyEmitter to the Emitter interface.
+// fileOnlyEmitterWrapper adapts FileOnlyEmitter to the Emitter interface with hash chaining.
 type fileOnlyEmitterWrapper struct {
-	emitter *FileOnlyEmitter
+	emitter       *FileOnlyEmitter
+	lastEventHash string
 }
 
-func (w *fileOnlyEmitterWrapper) EmitPartition(ctx context.Context, evt Event) error {
+func (w *fileOnlyEmitterWrapper) EmitPartition(ctx context.Context, evt Event) (string, error) {
 	pasEvent := convertToPASEvent(evt)
-	return w.emitter.Emit(&pasEvent)
+	if err := w.emitter.Emit(&pasEvent); err != nil {
+		return "", err
+	}
+	w.lastEventHash = pasEvent.Chain.EventHash
+	return pasEvent.Chain.EventHash, nil
+}
+
+func (w *fileOnlyEmitterWrapper) GetLastEventHash() string {
+	return w.lastEventHash
 }
 
 func (w *fileOnlyEmitterWrapper) Close() error {
 	return w.emitter.Close()
 }
 
-// convertToPASEvent converts a simplified Event to a full PASEvent.
+// convertToPASEvent converts a simplified Event to a full PASEvent with hash chaining.
 func convertToPASEvent(evt Event) PASEvent {
 	tables := make(map[string]TableInfo)
 	for tableName, checksum := range evt.Checksums {
@@ -101,7 +129,7 @@ func convertToPASEvent(evt Event) PASEvent {
 		}
 	}
 
-	return PASEvent{
+	pasEvent := PASEvent{
 		Version:   "1.1",
 		EventType: "bronze_partition",
 		Timestamp: time.Now().UTC(),
@@ -115,13 +143,27 @@ func convertToPASEvent(evt Event) PASEvent {
 		Tables:   tables,
 		Producer: evt.Producer,
 	}
+
+	// Set hash chain - this computes EventHash based on PrevEventHash and content
+	pasEvent.SetChainHashes(evt.PrevEventHash)
+
+	return pasEvent
 }
 
-// noopEmitter discards all events.
-type noopEmitter struct{}
+// noopEmitter discards all events but still tracks hashes for consistency.
+type noopEmitter struct {
+	lastEventHash string
+}
 
-func (n *noopEmitter) EmitPartition(_ context.Context, _ Event) error {
-	return nil
+func (n *noopEmitter) EmitPartition(_ context.Context, evt Event) (string, error) {
+	// Still compute the hash for consistency even though we don't emit
+	pasEvent := convertToPASEvent(evt)
+	n.lastEventHash = pasEvent.Chain.EventHash
+	return pasEvent.Chain.EventHash, nil
+}
+
+func (n *noopEmitter) GetLastEventHash() string {
+	return n.lastEventHash
 }
 
 func (n *noopEmitter) Close() error {

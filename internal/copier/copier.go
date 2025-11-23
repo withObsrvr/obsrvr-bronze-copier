@@ -397,16 +397,20 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 			byteSizes[tableName] = int64(len(parquetBytes))
 		}
 
-		if err := c.pas.EmitPartition(ctx, pas.Event{
-			EraID:        c.cfg.Era.EraID,
-			VersionLabel: c.cfg.Era.VersionLabel,
-			Network:      c.cfg.Era.Network,
-			Start:        part.Start,
-			End:          part.End,
-			Checksums:    output.Checksums,
-			RowCounts:    output.RowCounts,
-			ByteSizes:    byteSizes,
-			StoragePaths: storagePaths,
+		// Get the previous event hash for chain linking
+		prevEventHash := c.pas.GetLastEventHash()
+
+		if _, err := c.pas.EmitPartition(ctx, pas.Event{
+			EraID:         c.cfg.Era.EraID,
+			VersionLabel:  c.cfg.Era.VersionLabel,
+			Network:       c.cfg.Era.Network,
+			Start:         part.Start,
+			End:           part.End,
+			Checksums:     output.Checksums,
+			RowCounts:     output.RowCounts,
+			ByteSizes:     byteSizes,
+			StoragePaths:  storagePaths,
+			PrevEventHash: prevEventHash, // Hash chain link
 			Producer: pas.ProducerInfo{
 				Name:    "bronze-copier",
 				Version: Version,
@@ -542,8 +546,9 @@ func (c *Copier) recordPartitionMetadata(ctx context.Context, part tables.Partit
 	}
 }
 
-// emitPASEvent emits a PAS event for a partition.
+// emitPASEvent emits a PAS event for a partition with hash chaining.
 // This must be called sequentially to maintain hash chain ordering.
+// The prev_event_hash is automatically retrieved from the emitter.
 func (c *Copier) emitPASEvent(ctx context.Context, part tables.Partition, output *tables.ParquetOutput) error {
 	// Build storage paths and byte sizes for each table
 	storagePaths := make(map[string]string)
@@ -554,22 +559,27 @@ func (c *Copier) emitPASEvent(ctx context.Context, part tables.Partition, output
 		byteSizes[tableName] = int64(len(parquetBytes))
 	}
 
-	return c.pas.EmitPartition(ctx, pas.Event{
-		EraID:        c.cfg.Era.EraID,
-		VersionLabel: c.cfg.Era.VersionLabel,
-		Network:      c.cfg.Era.Network,
-		Start:        part.Start,
-		End:          part.End,
-		Checksums:    output.Checksums,
-		RowCounts:    output.RowCounts,
-		ByteSizes:    byteSizes,
-		StoragePaths: storagePaths,
+	// Get the previous event hash for chain linking
+	prevEventHash := c.pas.GetLastEventHash()
+
+	_, err := c.pas.EmitPartition(ctx, pas.Event{
+		EraID:         c.cfg.Era.EraID,
+		VersionLabel:  c.cfg.Era.VersionLabel,
+		Network:       c.cfg.Era.Network,
+		Start:         part.Start,
+		End:           part.End,
+		Checksums:     output.Checksums,
+		RowCounts:     output.RowCounts,
+		ByteSizes:     byteSizes,
+		StoragePaths:  storagePaths,
+		PrevEventHash: prevEventHash, // Hash chain link
 		Producer: pas.ProducerInfo{
 			Name:    "bronze-copier",
 			Version: Version,
 			GitSHA:  GitSHA,
 		},
 	})
+	return err
 }
 
 // saveCheckpoint saves the checkpoint for a partition.

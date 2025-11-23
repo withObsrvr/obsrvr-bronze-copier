@@ -171,16 +171,20 @@ func (c *Copier) publishPartition(ctx context.Context, part tables.Partition) (*
 			byteSizes[tableName] = int64(len(parquetBytes))
 		}
 
-		if err := c.pas.EmitPartition(ctx, pas.Event{
-			EraID:        c.cfg.Era.EraID,
-			VersionLabel: c.cfg.Era.VersionLabel,
-			Network:      c.cfg.Era.Network,
-			Start:        part.Start,
-			End:          part.End,
-			Checksums:    output.Checksums,
-			RowCounts:    output.RowCounts,
-			ByteSizes:    byteSizes,
-			StoragePaths: storagePaths,
+		// Get the previous event hash for chain linking
+		prevEventHash := c.pas.GetLastEventHash()
+
+		if _, err := c.pas.EmitPartition(ctx, pas.Event{
+			EraID:         c.cfg.Era.EraID,
+			VersionLabel:  c.cfg.Era.VersionLabel,
+			Network:       c.cfg.Era.Network,
+			Start:         part.Start,
+			End:           part.End,
+			Checksums:     output.Checksums,
+			RowCounts:     output.RowCounts,
+			ByteSizes:     byteSizes,
+			StoragePaths:  storagePaths,
+			PrevEventHash: prevEventHash, // Hash chain link
 			Producer: pas.ProducerInfo{
 				Name:    "bronze-copier",
 				Version: Version,
