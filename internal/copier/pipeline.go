@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/logging"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/metrics"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/source"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/tables"
 )
@@ -176,6 +177,13 @@ func (p *Pipeline) processTask(ctx context.Context, workerID int, task Partition
 		if task.Attempt < task.MaxRetry-1 {
 			log.Warn("partition build failed, retrying", "error", err)
 
+			// Record retry metric
+			if m := metrics.Get(); m != nil {
+				labels := p.getMetricsLabels()
+				labels.Operation = "partition_build"
+				m.IncRetryAttempts(labels)
+			}
+
 			// Exponential backoff
 			backoff := time.Duration(p.backoffMs*(1<<task.Attempt)) * time.Millisecond
 			select {
@@ -196,6 +204,20 @@ func (p *Pipeline) processTask(ctx context.Context, workerID int, task Partition
 
 	elapsed := time.Since(startTime)
 	log.Info("partition built", "duration_ms", elapsed.Milliseconds(), "rows", part.RowCount)
+
+	// Record metrics
+	if m := metrics.Get(); m != nil {
+		labels := p.getMetricsLabels()
+		m.ObservePartitionBuildDuration(labels, elapsed.Seconds())
+		m.ObservePartitionRows(labels, float64(part.RowCount))
+		if part.ByteSizes != nil {
+			var totalBytes int64
+			for _, b := range part.ByteSizes {
+				totalBytes += b
+			}
+			m.ObservePartitionBytes(labels, float64(totalBytes))
+		}
+	}
 
 	return PartitionResult{
 		Task:      task,
@@ -381,6 +403,9 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 			log.Warn("idempotency check failed", "error", err)
 		} else if exists {
 			log.Info("skipping partition (already committed)")
+			if m := metrics.Get(); m != nil {
+				m.IncPartitionsSkipped(p.getMetricsLabels())
+			}
 			return nil
 		}
 	}
@@ -391,6 +416,9 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 	// Step 3: Check storage existence
 	if exists, _ := c.store.Exists(ctx, ref); exists && !c.cfg.Era.AllowOverwrite {
 		log.Info("skipping partition (exists in storage)")
+		if m := metrics.Get(); m != nil {
+			m.IncPartitionsSkipped(p.getMetricsLabels())
+		}
 		return nil
 	}
 
@@ -457,5 +485,23 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 
 	log.Info("committed partition", "hash", part.DataHash, "prev_hash", prevHash)
 
+	// Record commit metrics
+	if m := metrics.Get(); m != nil {
+		labels := p.getMetricsLabels()
+		m.IncPartitionsProcessed(labels)
+		ledgerCount := float64(part.Range.End - part.Range.Start + 1)
+		m.AddLedgersProcessed(labels, ledgerCount)
+		m.SetLastLedgerSeq(labels, float64(part.Range.End))
+	}
+
 	return nil
+}
+
+// getMetricsLabels returns the standard metric labels for this pipeline.
+func (p *Pipeline) getMetricsLabels() metrics.Labels {
+	return metrics.Labels{
+		Network: p.copier.cfg.Era.Network,
+		EraID:   p.copier.cfg.Era.EraID,
+		Version: p.copier.cfg.Era.VersionLabel,
+	}
 }

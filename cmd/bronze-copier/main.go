@@ -13,6 +13,7 @@ import (
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/config"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/copier"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/logging"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/metrics"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/source"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/storage"
 )
@@ -84,6 +85,17 @@ func main() {
 		"era_id", cfg.Era.EraID,
 		"version_label", cfg.Era.VersionLabel,
 	)
+
+	// Initialize metrics
+	if cfg.Metrics.Enabled {
+		metrics.Init("bronze_copier")
+		go func() {
+			log.Info("starting metrics server", "address", cfg.Metrics.Address)
+			if err := metrics.StartServer(cfg.Metrics.Address); err != nil {
+				log.Error("metrics server failed", "error", err)
+			}
+		}()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

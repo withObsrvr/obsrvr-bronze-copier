@@ -37,12 +37,21 @@ type Config struct {
 
 	// Logging configuration
 	Logging LoggingConfig `yaml:"logging"`
+
+	// Metrics configuration
+	Metrics MetricsConfig `yaml:"metrics"`
 }
 
 // LoggingConfig defines logging settings.
 type LoggingConfig struct {
 	Format string `yaml:"format"` // "json" | "text"
 	Level  string `yaml:"level"`  // "debug" | "info" | "warn" | "error"
+}
+
+// MetricsConfig defines Prometheus metrics settings.
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Address string `yaml:"address"` // e.g., ":9090"
 }
 
 // EraConfig defines the era and version being processed.
@@ -215,6 +224,10 @@ func LoadFromEnv() Config {
 			Format: getenvDefault("LOG_FORMAT", "text"),
 			Level:  getenvDefault("LOG_LEVEL", "info"),
 		},
+		Metrics: MetricsConfig{
+			Enabled: os.Getenv("METRICS_ENABLED") == "true",
+			Address: getenvDefault("METRICS_ADDRESS", ":9090"),
+		},
 	}
 
 	return cfg
@@ -272,6 +285,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
+	}
+	if cfg.Metrics.Address == "" {
+		cfg.Metrics.Address = ":9090"
 	}
 }
 
