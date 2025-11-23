@@ -31,6 +31,7 @@ type Copier struct {
 	pas        pas.Emitter
 	checkpoint checkpoint.Manager
 	builder    *tables.PartitionBuilder
+	datasetID  int64 // cached dataset ID from catalog
 }
 
 // New creates a new Bronze Copier.
@@ -58,6 +59,12 @@ func New(cfg config.Config, src source.LedgerSource, store storage.BronzeStore) 
 
 // Run starts the Bronze copy process.
 func (c *Copier) Run(ctx context.Context) error {
+	// Register dataset with catalog and get ID for lineage records
+	if err := c.ensureDataset(ctx); err != nil {
+		log.Printf("[copier] warning: failed to ensure dataset in catalog: %v", err)
+		// Continue without catalog - it's optional
+	}
+
 	// Determine start ledger (from checkpoint or config)
 	startLedger := c.cfg.Era.LedgerStart
 	if c.checkpoint != nil {
@@ -159,6 +166,42 @@ func (c *Copier) Run(ctx context.Context) error {
 	}
 }
 
+// sourceLocation returns a string describing the data source for lineage tracking.
+func (c *Copier) sourceLocation() string {
+	switch c.cfg.Source.Mode {
+	case "gcs":
+		return fmt.Sprintf("gs://%s/%s", c.cfg.Source.GCSBucket, c.cfg.Source.GCSPrefix)
+	case "s3":
+		return fmt.Sprintf("s3://%s/%s", c.cfg.Source.S3Bucket, c.cfg.Source.S3Prefix)
+	case "local":
+		return c.cfg.Source.LocalPath
+	case "datastore":
+		return c.cfg.Source.DatastorePath
+	default:
+		return c.cfg.Source.Mode
+	}
+}
+
+// ensureDataset registers the dataset in the catalog and caches the ID.
+func (c *Copier) ensureDataset(ctx context.Context) error {
+	datasetID, err := c.meta.EnsureDataset(ctx, metadata.DatasetInfo{
+		Domain:      "bronze",
+		Dataset:     "ledgers_lcm_raw",
+		Version:     c.cfg.Era.VersionLabel,
+		EraID:       c.cfg.Era.EraID,
+		Network:     c.cfg.Era.Network,
+		Description: "Raw Ledger Close Meta (LCM) data from Stellar network",
+	})
+	if err != nil {
+		return err
+	}
+	c.datasetID = datasetID
+	if datasetID > 0 {
+		log.Printf("[copier] registered dataset in catalog: id=%d", datasetID)
+	}
+	return nil
+}
+
 // commitPartition writes a partition to storage with all metadata.
 func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) error {
 	log.Printf("[partition] processing era=%s v=%s range=%d-%d (%d ledgers)",
@@ -232,17 +275,35 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 	}
 
 	// Record in metadata catalog
-	if err := c.meta.RecordPartition(ctx, metadata.PartitionRecord{
-		EraID:           c.cfg.Era.EraID,
-		VersionLabel:    c.cfg.Era.VersionLabel,
-		Start:           part.Start,
-		End:             part.End,
-		Checksums:       output.Checksums,
-		RowCounts:       output.RowCounts,
-		ProducerVersion: fmt.Sprintf("bronze-copier@%s", Version),
-	}); err != nil {
-		log.Printf("[partition] warning: failed to record metadata: %v", err)
-		// Don't fail the partition for metadata errors
+	if c.datasetID > 0 {
+		// Calculate total byte size
+		var totalBytes int64
+		for _, parquetBytes := range output.Parquets {
+			totalBytes += int64(len(parquetBytes))
+		}
+
+		// Build storage path (first table as reference)
+		storagePath := fmt.Sprintf("%s/%s/%s/ledgers_lcm_raw/range=%d-%d",
+			c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, part.Start, part.End)
+
+		if err := c.meta.RecordPartition(ctx, metadata.PartitionRecord{
+			DatasetID:       c.datasetID,
+			EraID:           c.cfg.Era.EraID,
+			VersionLabel:    c.cfg.Era.VersionLabel,
+			Start:           part.Start,
+			End:             part.End,
+			Checksums:       output.Checksums,
+			RowCounts:       output.RowCounts,
+			ByteSize:        totalBytes,
+			StoragePath:     storagePath,
+			ProducerVersion: fmt.Sprintf("bronze-copier@%s", Version),
+			ProducerGitSHA:  GitSHA,
+			SourceType:      c.cfg.Source.Mode,
+			SourceLocation:  c.sourceLocation(),
+		}); err != nil {
+			log.Printf("[partition] warning: failed to record metadata: %v", err)
+			// Don't fail the partition for metadata errors
+		}
 	}
 
 	// Emit PAS event
