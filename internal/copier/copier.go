@@ -1,114 +1,118 @@
 package copier
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/config"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/metadata"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/pas"
-	"github.com/withObsrvr/obsrvr-bronze-copier/internal/util"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/source"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/storage"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/tables"
 )
 
 type Copier struct {
-	cfg *config.Config
+	cfg     config.Config
+	src     source.LedgerSource
+	store   storage.BronzeStore
+	meta    metadata.Writer
+	pas     pas.Emitter
+	builder *tables.PartitionBuilder
 }
 
-func New(cfg *config.Config) *Copier {
-	return &Copier{cfg: cfg}
+func New(cfg config.Config, src source.LedgerSource, store storage.BronzeStore) *Copier {
+	return &Copier{
+		cfg:     cfg,
+		src:     src,
+		store:   store,
+		meta:    metadata.NewWriter(metadata.CatalogConfig(cfg.Catalog)),
+		pas:     pas.NewEmitter(pas.PASConfig(cfg.PAS)),
+		builder: tables.NewPartitionBuilder(cfg.Era.PartitionSize),
+	}
 }
 
-func (c *Copier) CopyFile(src string) error {
-	seq := extractLedgerSeq(src)
-	ledgerRange := extractRange(src)
+func (c *Copier) Run(ctx context.Context) error {
+	ledgersCh, errCh := c.src.Stream(ctx, c.cfg.Era.LedgerStart, c.cfg.Era.LedgerEnd)
 
-	targetDir := filepath.Join(
-		c.cfg.BronzeRoot,
-		c.cfg.BronzeVersion,
-		fmt.Sprintf("network=%s", c.cfg.Network),
-		fmt.Sprintf("ledger_range=%s", ledgerRange),
-	)
+	for {
+		select {
+		case <-ctx.Done():
+			return c.src.Close()
 
-	if err := util.EnsureDir(targetDir); err != nil {
-		return err
+		case err := <-errCh:
+			return err
+
+		case lcm, ok := <-ledgersCh:
+			if !ok {
+				return nil
+			}
+
+			if err := c.builder.Add(lcm); err != nil {
+				return err
+			}
+
+			if c.builder.Ready() {
+				part := c.builder.Flush()
+				if err := c.commitPartition(ctx, part); err != nil {
+					return err
+				}
+			}
+		}
 	}
+}
 
-	dest := filepath.Join(targetDir, fmt.Sprintf("seq=%d.xdr.zst", seq))
+func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) error {
+	log.Printf("[partition] era=%s v=%s range=%d-%d",
+		c.cfg.Era.EraID, c.cfg.Era.VersionLabel, part.Start, part.End)
 
-	// Copy raw file
-	if err := copyRaw(src, dest); err != nil {
-		return err
-	}
-
-	info, err := os.Stat(dest)
+	parquets, checksums, rowCounts, err := part.ToParquet()
 	if err != nil {
 		return err
 	}
 
-	// Hash
-	sha, err := util.SHA256File(dest)
-	if err != nil {
+	for table, bytes := range parquets {
+		ref := storage.PartitionRef{
+			EraID:        c.cfg.Era.EraID,
+			VersionLabel: c.cfg.Era.VersionLabel,
+			Table:        table,
+			LedgerStart:  part.Start,
+			LedgerEnd:    part.End,
+		}
+
+		if exists, _ := c.store.Exists(ctx, ref); exists && !c.cfg.Era.AllowOverwrite {
+			return fmt.Errorf("partition already exists: %+v", ref)
+		}
+
+		if err := c.store.WriteParquet(ctx, ref, bytes); err != nil {
+			return err
+		}
+	}
+
+	if err := c.meta.RecordPartition(ctx, metadata.PartitionRecord{
+		EraID:           c.cfg.Era.EraID,
+		VersionLabel:    c.cfg.Era.VersionLabel,
+		Start:           part.Start,
+		End:             part.End,
+		Checksums:       checksums,
+		RowCounts:       rowCounts,
+		ProducerVersion: "bronze-copier@v0.1.0",
+	}); err != nil {
 		return err
 	}
 
-	// Metadata
-	meta := metadata.New(seq, c.cfg.Network, c.cfg.BronzeVersion, filepath.Base(dest), ledgerRange, sha, info.Size())
-	metaPath := filepath.Join(targetDir, fmt.Sprintf("seq=%d.meta.json", seq))
-	if err := meta.WriteJSON(metaPath); err != nil {
-		return err
+	if c.cfg.PAS.Enabled {
+		if err := c.pas.EmitPartition(ctx, pas.Event{
+			EraID:        c.cfg.Era.EraID,
+			VersionLabel: c.cfg.Era.VersionLabel,
+			Start:        part.Start,
+			End:          part.End,
+			Checksums:    checksums,
+		}); err != nil {
+			return err
+		}
 	}
 
-	// PAS
-	pasPath := filepath.Join(targetDir, "pas", fmt.Sprintf("%d.pas.json", seq))
-	if err := pas.AppendPAS(seq, c.cfg.BronzeVersion, sha, pasPath); err != nil {
-		return err
-	}
-
-	log.Printf("bronze: wrote %s (sha=%s)", dest, sha)
 	return nil
-}
-
-func copyRaw(src, dest string) error {
-	if err := util.EnsureDir(filepath.Dir(dest)); err != nil {
-		return err
-	}
-
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	return err
-}
-
-func extractLedgerSeq(path string) int64 {
-	base := filepath.Base(path)
-	clean := strings.TrimSuffix(base, ".xdr.zst")
-	if strings.HasPrefix(clean, "seq=") {
-		clean = strings.TrimPrefix(clean, "seq=")
-	}
-	parts := strings.Split(clean, "--")
-	seqStr := parts[len(parts)-1]
-	out, _ := util.Atoi(seqStr)
-	return out
-}
-
-func extractRange(path string) string {
-	dir := filepath.Base(filepath.Dir(path))
-	if idx := strings.LastIndex(dir, "--"); idx >= 0 && idx+2 < len(dir) {
-		return dir[idx+2:]
-	}
-	return "unknown"
 }
