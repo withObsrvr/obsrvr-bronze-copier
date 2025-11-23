@@ -26,3 +26,6 @@ checkpoints/
 # OS files
 .DS_Store
 Thumbs.db
+
+pas-backup/
+state/
