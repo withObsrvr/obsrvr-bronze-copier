@@ -110,6 +110,7 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 
 	ledgerCount := 0
 	partitionCount := 0
+	skippedCount := 0
 	startTime := time.Now()
 
 	for {
@@ -118,7 +119,7 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 			// Flush any remaining ledgers
 			if remaining := c.builder.FlushRemaining(); remaining != nil {
 				log.Printf("[copier] flushing remaining %d ledgers on shutdown", len(remaining.Ledgers))
-				if err := c.commitPartition(ctx, *remaining); err != nil {
+				if _, err := c.publishPartition(ctx, *remaining); err != nil && !errors.Is(err, ErrPartitionExists) {
 					log.Printf("[copier] error flushing remaining: %v", err)
 				}
 			}
@@ -135,16 +136,21 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 				// Stream complete - flush remaining
 				if remaining := c.builder.FlushRemaining(); remaining != nil {
 					log.Printf("[copier] flushing final partition with %d ledgers", len(remaining.Ledgers))
-					if err := c.commitPartition(ctx, *remaining); err != nil {
-						return fmt.Errorf("commit final partition: %w", err)
+					if _, err := c.publishPartition(ctx, *remaining); err != nil {
+						if errors.Is(err, ErrPartitionExists) {
+							skippedCount++
+						} else {
+							return fmt.Errorf("publish final partition: %w", err)
+						}
+					} else {
+						partitionCount++
 					}
-					partitionCount++
 				}
 
 				elapsed := time.Since(startTime)
 				rate := float64(ledgerCount) / elapsed.Seconds()
-				log.Printf("[copier] complete: %d ledgers, %d partitions, %.2f ledgers/sec",
-					ledgerCount, partitionCount, rate)
+				log.Printf("[copier] complete: %d ledgers, %d partitions published, %d skipped, %.2f ledgers/sec",
+					ledgerCount, partitionCount, skippedCount, rate)
 				return nil
 			}
 
@@ -162,16 +168,23 @@ func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
 					return fmt.Errorf("partition validation failed: %w", err)
 				}
 
-				if err := c.commitPartition(ctx, part); err != nil {
-					return fmt.Errorf("commit partition %d-%d: %w", part.Start, part.End, err)
+				// Use publishPartition for transactional lifecycle
+				if _, err := c.publishPartition(ctx, part); err != nil {
+					if errors.Is(err, ErrPartitionExists) {
+						// Partition already exists - skip (idempotent)
+						skippedCount++
+					} else {
+						return fmt.Errorf("publish partition %d-%d: %w", part.Start, part.End, err)
+					}
+				} else {
+					partitionCount++
 				}
-				partitionCount++
 
 				// Log progress
 				elapsed := time.Since(startTime)
 				rate := float64(ledgerCount) / elapsed.Seconds()
-				log.Printf("[copier] progress: %d ledgers, %d partitions, %.2f ledgers/sec",
-					ledgerCount, partitionCount, rate)
+				log.Printf("[copier] progress: %d ledgers, %d partitions, %d skipped, %.2f ledgers/sec",
+					ledgerCount, partitionCount, skippedCount, rate)
 			}
 		}
 	}

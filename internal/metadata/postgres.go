@@ -180,9 +180,25 @@ func (w *PostgresWriter) RecordPartition(ctx context.Context, rec PartitionRecor
 	return nil
 }
 
-// GetLatestLedger returns the highest committed ledger for a dataset.
-// This can be used as a fallback for checkpoint recovery.
-func (w *PostgresWriter) GetLatestLedger(ctx context.Context, datasetID int64) (uint32, error) {
+// PartitionExists checks if a partition has already been committed.
+func (w *PostgresWriter) PartitionExists(ctx context.Context, datasetID int64, start, end uint32) (bool, error) {
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM _meta_lineage
+			WHERE dataset_id = $1 AND ledger_start = $2 AND ledger_end = $3
+		)
+	`
+
+	var exists bool
+	err := w.pool.QueryRow(ctx, query, datasetID, int64(start), int64(end)).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check partition exists: %w", err)
+	}
+	return exists, nil
+}
+
+// GetLastCommittedLedger returns the highest committed ledger for a dataset.
+func (w *PostgresWriter) GetLastCommittedLedger(ctx context.Context, datasetID int64) (uint32, error) {
 	query := `
 		SELECT COALESCE(MAX(ledger_end), 0)
 		FROM _meta_lineage
@@ -199,6 +215,27 @@ func (w *PostgresWriter) GetLatestLedger(ctx context.Context, datasetID int64) (
 	}
 
 	return uint32(maxLedger), nil
+}
+
+// GetLastChecksum returns the checksum of the most recent partition.
+// Used for PAS hash chaining.
+func (w *PostgresWriter) GetLastChecksum(ctx context.Context, datasetID int64) (string, error) {
+	query := `
+		SELECT checksum FROM _meta_lineage
+		WHERE dataset_id = $1
+		ORDER BY ledger_end DESC
+		LIMIT 1
+	`
+
+	var checksum string
+	err := w.pool.QueryRow(ctx, query, datasetID).Scan(&checksum)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return "", nil // No previous partition
+		}
+		return "", fmt.Errorf("get last checksum: %w", err)
+	}
+	return checksum, nil
 }
 
 // GetCoverageGaps finds gaps in the lineage for a dataset.

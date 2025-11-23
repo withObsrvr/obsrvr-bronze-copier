@@ -91,6 +91,49 @@ type BronzeStore interface {
 	Close() error
 }
 
+// AtomicStore extends BronzeStore with atomic publish capabilities.
+// This is the preferred interface for production use.
+type AtomicStore interface {
+	BronzeStore
+
+	// WriteParquetTemp writes parquet bytes to a temporary location.
+	// Returns the temp key that can be passed to Finalize.
+	WriteParquetTemp(ctx context.Context, ref PartitionRef, parquetBytes []byte) (tempKey string, err error)
+
+	// WriteManifestTemp writes a manifest to a temporary location.
+	WriteManifestTemp(ctx context.Context, ref PartitionRef, manifest *Manifest) (tempKey string, err error)
+
+	// Finalize atomically moves temp files to their canonical location.
+	// For object stores this is copy+delete; for local filesystem it's rename.
+	// If any file fails to finalize, all should be rolled back.
+	Finalize(ctx context.Context, ref PartitionRef, tempKeys []string) error
+
+	// Abort removes temporary files without publishing.
+	Abort(ctx context.Context, tempKeys []string) error
+
+	// Head returns metadata about a stored object (size, checksum if available).
+	Head(ctx context.Context, key string) (*ObjectInfo, error)
+
+	// List returns all keys with the given prefix.
+	List(ctx context.Context, prefix string) ([]string, error)
+}
+
+// ObjectInfo contains metadata about a stored object.
+type ObjectInfo struct {
+	Key      string
+	Size     int64
+	ETag     string // MD5 for S3/GCS, empty for local
+	ModTime  time.Time
+}
+
+// PublishResult contains the result of an atomic publish operation.
+type PublishResult struct {
+	ParquetKey  string
+	ManifestKey string
+	Checksum    string
+	ByteSize    int64
+}
+
 // StorageConfig configures the storage backend.
 type StorageConfig struct {
 	Backend string // "local" | "gcs" | "s3"

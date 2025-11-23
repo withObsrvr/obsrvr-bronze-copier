@@ -21,6 +21,18 @@ type Writer interface {
 	// RecordPartition writes a lineage record for a committed partition.
 	RecordPartition(ctx context.Context, rec PartitionRecord) error
 
+	// PartitionExists checks if a partition has already been committed.
+	// Used for idempotency - skip partitions that are already done.
+	PartitionExists(ctx context.Context, datasetID int64, start, end uint32) (bool, error)
+
+	// GetLastCommittedLedger returns the highest ledger_end for a dataset.
+	// Used to determine where to resume from.
+	GetLastCommittedLedger(ctx context.Context, datasetID int64) (uint32, error)
+
+	// GetLastChecksum returns the checksum of the most recent partition.
+	// Used for PAS hash chaining (prev_hash).
+	GetLastChecksum(ctx context.Context, datasetID int64) (string, error)
+
 	// Close releases database connections.
 	Close() error
 }
@@ -89,6 +101,18 @@ func (n *noopWriter) EnsureDataset(_ context.Context, _ DatasetInfo) (int64, err
 
 func (n *noopWriter) RecordPartition(_ context.Context, _ PartitionRecord) error {
 	return nil
+}
+
+func (n *noopWriter) PartitionExists(_ context.Context, _ int64, _, _ uint32) (bool, error) {
+	return false, nil // Always process when no catalog
+}
+
+func (n *noopWriter) GetLastCommittedLedger(_ context.Context, _ int64) (uint32, error) {
+	return 0, nil // No catalog means no history
+}
+
+func (n *noopWriter) GetLastChecksum(_ context.Context, _ int64) (string, error) {
+	return "", nil // No previous checksum
 }
 
 func (n *noopWriter) Close() error {
