@@ -1,0 +1,71 @@
+# Bronze Copier Configuration Example
+# Copy this to config.yaml and customize for your deployment
+
+copier_id: "bronze-copier-001"
+
+# Era configuration - defines what data we're processing
+era:
+  era_id: "pre_p23"           # Era identifier (e.g., "pre_p23", "p23_plus")
+  version_label: "v1"         # Version of Bronze schema
+  network: "pubnet"           # Network name ("pubnet" or "testnet")
+  ledger_start: 1             # Starting ledger (inclusive)
+  ledger_end: 0               # Ending ledger (0 = unbounded/tail)
+  partition_size: 10000       # Ledgers per partition
+  allow_overwrite: false      # Allow overwriting existing partitions
+
+# Source configuration - where to read ledger data from
+source:
+  mode: "local"               # "local" | "gcs" | "s3"
+
+  # Local filesystem source
+  local_path: "./testdata/archive"
+
+  # GCS source (uncomment to use)
+  # mode: "gcs"
+  # gcs_bucket: "obsrvr-stellar-ledger-data-pubnet-data"
+  # gcs_prefix: "landing/ledgers/pubnet/"
+
+  # S3 source (also works for B2, R2, MinIO)
+  # mode: "s3"
+  # s3_bucket: "my-bucket"
+  # s3_prefix: "ledgers/"
+  # s3_endpoint: "https://s3.us-west-000.backblazeb2.com"  # For B2/MinIO/R2
+  # s3_region: "us-west-000"
+
+# Storage configuration - where to write Bronze output
+storage:
+  backend: "local"            # "local" | "gcs" | "s3"
+  prefix: "bronze/"           # Path prefix for all output
+
+  # Local filesystem storage
+  local_dir: "./data"
+
+  # GCS storage (uncomment to use)
+  # backend: "gcs"
+  # gcs_bucket: "obsrvr-bronze-output"
+
+  # S3 storage (also works for B2, R2, MinIO)
+  # backend: "s3"
+  # s3_bucket: "my-bronze-bucket"
+  # s3_endpoint: "https://s3.us-west-000.backblazeb2.com"
+  # s3_region: "us-west-000"
+
+# Catalog configuration (optional) - metadata tracking
+catalog:
+  postgres_dsn: ""            # PostgreSQL connection string
+  namespace: "mainnet"        # Namespace for metadata tables
+
+# PAS configuration (optional) - Public Audit Stream
+pas:
+  enabled: false
+  endpoint: ""                # PAS server URL
+  backup_dir: "./pas-backup"  # Local backup for PAS events
+
+# Checkpoint configuration - resume support
+checkpoint:
+  enabled: true
+  dir: "./state"              # Directory for checkpoint files
+
+# Performance configuration
+perf:
+  max_in_flight_partitions: 4 # Max concurrent partition commits

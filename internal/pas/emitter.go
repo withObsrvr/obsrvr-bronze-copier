@@ -1,11 +1,10 @@
 package pas
 
-import "context"
+import (
+	"context"
 
-type PASConfig struct {
-	Enabled  bool
-	Endpoint string
-}
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/config"
+)
 
 type Event struct {
 	EraID        string
@@ -21,12 +20,12 @@ type Emitter interface {
 
 // NewEmitter returns a placeholder emitter to be replaced with the PAS v1.1
 // client when available.
-func NewEmitter(cfg PASConfig) Emitter {
+func NewEmitter(cfg config.PASConfig) Emitter {
 	return noopEmitter{cfg: cfg}
 }
 
 type noopEmitter struct {
-	cfg PASConfig
+	cfg config.PASConfig
 }
 
 func (n noopEmitter) EmitPartition(_ context.Context, _ Event) error { return nil }
