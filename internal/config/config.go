@@ -262,3 +262,70 @@ func parseInt(v string) int {
 	}
 	return parsed
 }
+
+// Validate checks the configuration for errors.
+func Validate(cfg Config) error {
+	// Validate era configuration
+	if cfg.Era.Network == "" {
+		return fmt.Errorf("era.network is required")
+	}
+	if cfg.Era.EraID == "" {
+		return fmt.Errorf("era.era_id is required")
+	}
+	if cfg.Era.VersionLabel == "" {
+		return fmt.Errorf("era.version_label is required")
+	}
+	if cfg.Era.PartitionSize == 0 {
+		return fmt.Errorf("era.partition_size must be > 0")
+	}
+
+	// Validate source configuration
+	switch cfg.Source.Mode {
+	case "local":
+		if cfg.Source.LocalPath == "" {
+			return fmt.Errorf("source.local_path is required when mode=local")
+		}
+	case "gcs":
+		if cfg.Source.GCSBucket == "" {
+			return fmt.Errorf("source.gcs_bucket is required when mode=gcs")
+		}
+	case "s3":
+		if cfg.Source.S3Bucket == "" {
+			return fmt.Errorf("source.s3_bucket is required when mode=s3")
+		}
+	case "datastore":
+		if cfg.Source.DatastorePath == "" {
+			return fmt.Errorf("source.datastore_path is required when mode=datastore")
+		}
+		if cfg.Source.DatastoreType != "GCS" && cfg.Source.DatastoreType != "S3" {
+			return fmt.Errorf("source.datastore_type must be 'GCS' or 'S3'")
+		}
+	default:
+		return fmt.Errorf("source.mode must be one of: local, gcs, s3, datastore")
+	}
+
+	// Validate storage configuration
+	switch cfg.Storage.Backend {
+	case "local":
+		if cfg.Storage.LocalDir == "" {
+			return fmt.Errorf("storage.local_dir is required when backend=local")
+		}
+	case "gcs":
+		if cfg.Storage.GCSBucket == "" {
+			return fmt.Errorf("storage.gcs_bucket is required when backend=gcs")
+		}
+	case "s3":
+		if cfg.Storage.S3Bucket == "" {
+			return fmt.Errorf("storage.s3_bucket is required when backend=s3")
+		}
+	default:
+		return fmt.Errorf("storage.backend must be one of: local, gcs, s3")
+	}
+
+	// Validate perf configuration
+	if cfg.Perf.MaxInFlightPartitions < 1 {
+		return fmt.Errorf("perf.max_in_flight_partitions must be >= 1")
+	}
+
+	return nil
+}

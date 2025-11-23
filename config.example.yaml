@@ -15,12 +15,17 @@ era:
 
 # Source configuration - where to read ledger data from
 source:
-  mode: "local"               # "local" | "gcs" | "s3"
+  # Datastore mode (RECOMMENDED) - uses Stellar BufferedStorageBackend
+  # This is the most reliable way to read Galexie archives
+  mode: "datastore"
+  datastore_type: "GCS"       # "GCS" or "S3"
+  datastore_path: "obsrvr-stellar-ledger-data-pubnet-data/landing/ledgers/pubnet"
 
-  # Local filesystem source
-  local_path: "./testdata/archive"
+  # Local filesystem source (for testing)
+  # mode: "local"
+  # local_path: "./testdata/archive"
 
-  # GCS source (uncomment to use)
+  # Direct GCS source (uncomment to use)
   # mode: "gcs"
   # gcs_bucket: "obsrvr-stellar-ledger-data-pubnet-data"
   # gcs_prefix: "landing/ledgers/pubnet/"

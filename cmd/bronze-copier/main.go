@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -15,10 +17,53 @@ import (
 )
 
 func main() {
+	// Parse CLI flags
+	var (
+		configFile   = flag.String("config", "", "Path to YAML configuration file")
+		showVersion  = flag.Bool("version", false, "Show version and exit")
+		validateOnly = flag.Bool("validate", false, "Validate configuration and exit")
+	)
+	flag.Parse()
+
+	// Handle version flag
+	if *showVersion {
+		fmt.Printf("bronze-copier %s (%s)\n", copier.Version, copier.GitSHA)
+		os.Exit(0)
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("[main] Bronze Copier %s (%s)", copier.Version, copier.GitSHA)
 
-	cfg := config.MustLoad()
+	// Load configuration
+	var cfg config.Config
+	var err error
+
+	if *configFile != "" {
+		cfg, err = config.LoadFromFile(*configFile)
+		if err != nil {
+			log.Fatalf("[config] failed to load config file: %v", err)
+		}
+		log.Printf("[config] loaded from %s", *configFile)
+	} else if envConfig := os.Getenv("CONFIG_FILE"); envConfig != "" {
+		cfg, err = config.LoadFromFile(envConfig)
+		if err != nil {
+			log.Fatalf("[config] failed to load config file: %v", err)
+		}
+		log.Printf("[config] loaded from %s (via CONFIG_FILE)", envConfig)
+	} else {
+		cfg = config.LoadFromEnv()
+		log.Printf("[config] loaded from environment variables")
+	}
+
+	// Validate configuration
+	if err := config.Validate(cfg); err != nil {
+		log.Fatalf("[config] validation failed: %v", err)
+	}
+
+	if *validateOnly {
+		log.Println("[config] configuration is valid")
+		os.Exit(0)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
