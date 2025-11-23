@@ -179,3 +179,36 @@ func NewBronzeStore(cfg StorageConfig) (BronzeStore, error) {
 		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Backend)
 	}
 }
+
+// NewAtomicStore creates an atomic storage backend based on configuration.
+// All supported backends (local, gcs, s3) implement AtomicStore.
+func NewAtomicStore(cfg StorageConfig) (AtomicStore, error) {
+	switch cfg.Backend {
+	case "local":
+		if cfg.LocalDir == "" {
+			return nil, fmt.Errorf("LocalDir required for local backend")
+		}
+		return NewLocalStore(cfg.LocalDir, cfg.Prefix)
+	case "gcs":
+		if cfg.GCSBucket == "" {
+			return nil, fmt.Errorf("GCSBucket required for gcs backend")
+		}
+		return NewGCSStore(cfg.GCSBucket, cfg.Prefix)
+	case "s3":
+		if cfg.S3Bucket == "" {
+			return nil, fmt.Errorf("S3Bucket required for s3 backend")
+		}
+		return NewS3Store(cfg.S3Bucket, cfg.Prefix, cfg.S3Endpoint, cfg.S3Region)
+	default:
+		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Backend)
+	}
+}
+
+// AsAtomic attempts to cast a BronzeStore to AtomicStore.
+// Returns nil if the store doesn't support atomic operations.
+func AsAtomic(store BronzeStore) AtomicStore {
+	if atomic, ok := store.(AtomicStore); ok {
+		return atomic
+	}
+	return nil
+}

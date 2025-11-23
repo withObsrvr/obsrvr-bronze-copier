@@ -11,6 +11,7 @@ import (
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/logging"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/metrics"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/source"
+	"github.com/withObsrvr/obsrvr-bronze-copier/internal/storage"
 	"github.com/withObsrvr/obsrvr-bronze-copier/internal/tables"
 )
 
@@ -422,15 +423,24 @@ func (p *Pipeline) commitPartition(ctx context.Context, part *BuiltPartition) er
 		return nil
 	}
 
-	// Step 4: Write parquet to storage
-	if err := c.store.WriteParquet(ctx, ref, part.ParquetBytes); err != nil {
-		return fmt.Errorf("write parquet: %w", err)
-	}
-
-	// Step 5: Write manifest
+	// Step 4 & 5: Write parquet and manifest to storage
 	manifest := buildManifest(part, ref)
-	if err := c.store.WriteManifest(ctx, ref, manifest); err != nil {
-		return fmt.Errorf("write manifest: %w", err)
+
+	// Check if store supports atomic writes
+	atomicStore := storage.AsAtomic(c.store)
+	if atomicStore != nil {
+		// Atomic path: temp -> finalize
+		if err := p.writeAtomic(ctx, atomicStore, ref, part.ParquetBytes, manifest); err != nil {
+			return fmt.Errorf("atomic write: %w", err)
+		}
+	} else {
+		// Fallback: direct write (non-atomic)
+		if err := c.store.WriteParquet(ctx, ref, part.ParquetBytes); err != nil {
+			return fmt.Errorf("write parquet: %w", err)
+		}
+		if err := c.store.WriteManifest(ctx, ref, manifest); err != nil {
+			return fmt.Errorf("write manifest: %w", err)
+		}
 	}
 
 	// Derive storage URI
@@ -504,4 +514,33 @@ func (p *Pipeline) getMetricsLabels() metrics.Labels {
 		EraID:   p.copier.cfg.Era.EraID,
 		Version: p.copier.cfg.Era.VersionLabel,
 	}
+}
+
+// writeAtomic writes parquet and manifest files atomically using temp files.
+// If any step fails, all temp files are cleaned up.
+func (p *Pipeline) writeAtomic(ctx context.Context, store storage.AtomicStore, ref storage.PartitionRef, parquetData []byte, manifest *storage.Manifest) error {
+	var tempKeys []string
+
+	// Write parquet to temp location
+	tempParquet, err := store.WriteParquetTemp(ctx, ref, parquetData)
+	if err != nil {
+		return fmt.Errorf("write parquet temp: %w", err)
+	}
+	tempKeys = append(tempKeys, tempParquet)
+
+	// Write manifest to temp location
+	tempManifest, err := store.WriteManifestTemp(ctx, ref, manifest)
+	if err != nil {
+		store.Abort(ctx, tempKeys)
+		return fmt.Errorf("write manifest temp: %w", err)
+	}
+	tempKeys = append(tempKeys, tempManifest)
+
+	// Atomic finalize - moves all temp files to final locations
+	if err := store.Finalize(ctx, ref, tempKeys); err != nil {
+		// Finalize handles its own cleanup on failure
+		return fmt.Errorf("finalize: %w", err)
+	}
+
+	return nil
 }
