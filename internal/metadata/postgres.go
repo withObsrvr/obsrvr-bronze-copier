@@ -279,6 +279,120 @@ func (w *PostgresWriter) GetCoverageGaps(ctx context.Context, datasetID int64, f
 	return gaps, rows.Err()
 }
 
+// GetLastLineage returns the most recent lineage record for hash chaining.
+func (w *PostgresWriter) GetLastLineage(ctx context.Context, datasetID int64) (*LineageRecord, error) {
+	query := `
+		SELECT ledger_start, ledger_end, row_count, byte_size, checksum,
+		       COALESCE(prev_hash, ''), storage_path, COALESCE(storage_uri, ''),
+		       producer_version, COALESCE(producer_git_sha, ''),
+		       COALESCE(source_type, ''), COALESCE(source_location, '')
+		FROM _meta_lineage
+		WHERE dataset_id = $1
+		ORDER BY ledger_end DESC
+		LIMIT 1
+	`
+
+	var rec LineageRecord
+	rec.DatasetID = datasetID
+
+	err := w.pool.QueryRow(ctx, query, datasetID).Scan(
+		&rec.LedgerStart, &rec.LedgerEnd, &rec.RowCount, &rec.ByteSize,
+		&rec.Checksum, &rec.PrevHash, &rec.StoragePath, &rec.StorageURI,
+		&rec.ProducerVersion, &rec.ProducerGitSHA,
+		&rec.SourceType, &rec.SourceLocation,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil // No previous lineage
+		}
+		return nil, fmt.Errorf("get last lineage: %w", err)
+	}
+	return &rec, nil
+}
+
+// InsertLineage records a lineage entry with prev_hash chain.
+func (w *PostgresWriter) InsertLineage(ctx context.Context, rec LineageRecord) error {
+	query := `
+		INSERT INTO _meta_lineage (
+			dataset_id, ledger_start, ledger_end, row_count, byte_size,
+			checksum, prev_hash, storage_path, storage_uri,
+			producer_version, producer_git_sha, source_type, source_location
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT (dataset_id, ledger_start, ledger_end)
+		DO UPDATE SET
+			row_count = EXCLUDED.row_count,
+			byte_size = EXCLUDED.byte_size,
+			checksum = EXCLUDED.checksum,
+			prev_hash = EXCLUDED.prev_hash,
+			storage_uri = EXCLUDED.storage_uri,
+			created_at = NOW()
+	`
+
+	var prevHash *string
+	if rec.PrevHash != "" {
+		prevHash = &rec.PrevHash
+	}
+
+	var storageURI *string
+	if rec.StorageURI != "" {
+		storageURI = &rec.StorageURI
+	}
+
+	_, err := w.pool.Exec(ctx, query,
+		rec.DatasetID,
+		int64(rec.LedgerStart),
+		int64(rec.LedgerEnd),
+		rec.RowCount,
+		rec.ByteSize,
+		rec.Checksum,
+		prevHash,
+		rec.StoragePath,
+		storageURI,
+		rec.ProducerVersion,
+		rec.ProducerGitSHA,
+		rec.SourceType,
+		rec.SourceLocation,
+	)
+	if err != nil {
+		return fmt.Errorf("insert lineage: %w", err)
+	}
+
+	log.Printf("[metadata] recorded lineage for range %d-%d (prev_hash=%s)",
+		rec.LedgerStart, rec.LedgerEnd, rec.PrevHash)
+	return nil
+}
+
+// InsertQuality records a quality validation result.
+func (w *PostgresWriter) InsertQuality(ctx context.Context, rec QualityRecord) error {
+	query := `
+		INSERT INTO _meta_quality (dataset_id, ledger_start, ledger_end, passed, error_message)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (dataset_id, ledger_start, ledger_end)
+		DO UPDATE SET
+			passed = EXCLUDED.passed,
+			error_message = EXCLUDED.error_message,
+			created_at = NOW()
+	`
+
+	var errMsg *string
+	if rec.ErrorMessage != "" {
+		errMsg = &rec.ErrorMessage
+	}
+
+	_, err := w.pool.Exec(ctx, query,
+		rec.DatasetID,
+		int64(rec.LedgerStart),
+		int64(rec.LedgerEnd),
+		rec.Passed,
+		errMsg,
+	)
+	if err != nil {
+		return fmt.Errorf("insert quality: %w", err)
+	}
+	return nil
+}
+
 // Close releases database connections.
 func (w *PostgresWriter) Close() error {
 	w.pool.Close()

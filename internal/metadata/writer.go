@@ -33,6 +33,16 @@ type Writer interface {
 	// Used for PAS hash chaining (prev_hash).
 	GetLastChecksum(ctx context.Context, datasetID int64) (string, error)
 
+	// GetLastLineage returns the most recent lineage record for hash chaining.
+	// Returns nil if no previous lineage exists.
+	GetLastLineage(ctx context.Context, datasetID int64) (*LineageRecord, error)
+
+	// InsertLineage records a lineage entry with prev_hash chain.
+	InsertLineage(ctx context.Context, rec LineageRecord) error
+
+	// InsertQuality records a quality validation result.
+	InsertQuality(ctx context.Context, rec QualityRecord) error
+
 	// Close releases database connections.
 	Close() error
 }
@@ -48,7 +58,7 @@ type DatasetInfo struct {
 	Description string
 }
 
-// PartitionRecord describes a committed partition.
+// PartitionRecord describes a committed partition (legacy interface).
 type PartitionRecord struct {
 	// Dataset identification (either DatasetID or DatasetInfo must be set)
 	DatasetID int64
@@ -70,6 +80,32 @@ type PartitionRecord struct {
 	ProducerGitSHA  string
 	SourceType      string
 	SourceLocation  string
+}
+
+// LineageRecord is a complete lineage entry with hash chaining.
+type LineageRecord struct {
+	DatasetID       int64
+	LedgerStart     uint32
+	LedgerEnd       uint32
+	RowCount        int64
+	ByteSize        int64
+	Checksum        string // sha256 of this partition
+	PrevHash        string // checksum of previous partition (for chain verification)
+	StoragePath     string
+	StorageURI      string
+	ProducerVersion string
+	ProducerGitSHA  string
+	SourceType      string
+	SourceLocation  string
+}
+
+// QualityRecord tracks validation results per partition.
+type QualityRecord struct {
+	DatasetID    int64
+	LedgerStart  uint32
+	LedgerEnd    uint32
+	Passed       bool
+	ErrorMessage string // non-empty if validation failed
 }
 
 // NewWriter creates a Writer based on configuration.
@@ -113,6 +149,18 @@ func (n *noopWriter) GetLastCommittedLedger(_ context.Context, _ int64) (uint32,
 
 func (n *noopWriter) GetLastChecksum(_ context.Context, _ int64) (string, error) {
 	return "", nil // No previous checksum
+}
+
+func (n *noopWriter) GetLastLineage(_ context.Context, _ int64) (*LineageRecord, error) {
+	return nil, nil // No previous lineage
+}
+
+func (n *noopWriter) InsertLineage(_ context.Context, _ LineageRecord) error {
+	return nil
+}
+
+func (n *noopWriter) InsertQuality(_ context.Context, _ QualityRecord) error {
+	return nil
 }
 
 func (n *noopWriter) Close() error {

@@ -10,8 +10,9 @@ import (
 
 // GCSStore writes parquet files to Google Cloud Storage.
 type GCSStore struct {
-	bucket *blob.Bucket
-	prefix string
+	bucket     *blob.Bucket
+	bucketName string
+	prefix     string
 }
 
 // NewGCSStore creates a new GCS store.
@@ -24,8 +25,9 @@ func NewGCSStore(bucketName, prefix string) (*GCSStore, error) {
 	}
 
 	return &GCSStore{
-		bucket: bucket,
-		prefix: prefix,
+		bucket:     bucket,
+		bucketName: bucketName,
+		prefix:     prefix,
 	}, nil
 }
 
@@ -80,6 +82,11 @@ func (s *GCSStore) WriteManifest(ctx context.Context, ref PartitionRef, manifest
 func (s *GCSStore) Exists(ctx context.Context, ref PartitionRef) (bool, error) {
 	path := ref.Path(s.prefix)
 	return s.bucket.Exists(ctx, path)
+}
+
+// URI returns the canonical URI for the given key.
+func (s *GCSStore) URI(key string) string {
+	return fmt.Sprintf("gs://%s/%s", s.bucketName, key)
 }
 
 // Close releases the bucket connection.

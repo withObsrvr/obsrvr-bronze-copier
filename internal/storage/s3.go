@@ -11,8 +11,9 @@ import (
 
 // S3Store writes parquet files to S3-compatible storage.
 type S3Store struct {
-	bucket *blob.Bucket
-	prefix string
+	bucket     *blob.Bucket
+	bucketName string
+	prefix     string
 }
 
 // NewS3Store creates a new S3-compatible store.
@@ -41,8 +42,9 @@ func NewS3Store(bucketName, prefix, endpoint, region string) (*S3Store, error) {
 	}
 
 	return &S3Store{
-		bucket: bucket,
-		prefix: prefix,
+		bucket:     bucket,
+		bucketName: bucketName,
+		prefix:     prefix,
 	}, nil
 }
 
@@ -97,6 +99,11 @@ func (s *S3Store) WriteManifest(ctx context.Context, ref PartitionRef, manifest 
 func (s *S3Store) Exists(ctx context.Context, ref PartitionRef) (bool, error) {
 	path := ref.Path(s.prefix)
 	return s.bucket.Exists(ctx, path)
+}
+
+// URI returns the canonical URI for the given key.
+func (s *S3Store) URI(key string) string {
+	return fmt.Sprintf("s3://%s/%s", s.bucketName, key)
 }
 
 // Close releases the bucket connection.

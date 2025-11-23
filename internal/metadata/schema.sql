@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS _meta_lineage (
     row_count           BIGINT NOT NULL,
     byte_size           BIGINT NOT NULL,
     checksum            VARCHAR(128) NOT NULL,   -- sha256 of parquet file
+    prev_hash           VARCHAR(128),            -- hash of previous partition (for chain verification)
     storage_path        TEXT NOT NULL,           -- full path to parquet
+    storage_uri         TEXT,                    -- full URI (gs://bucket/path or file:///path)
     producer_version    VARCHAR(64) NOT NULL,    -- "bronze-copier@v0.1.0"
     producer_git_sha    VARCHAR(64),
     source_type         VARCHAR(32),             -- "archive" | "live"
@@ -44,16 +46,22 @@ CREATE INDEX IF NOT EXISTS idx_lineage_dataset_range
 CREATE INDEX IF NOT EXISTS idx_lineage_ledger_end
     ON _meta_lineage(dataset_id, ledger_end);
 
--- Quality metrics per partition (for future use)
+-- Quality validation results per partition
 CREATE TABLE IF NOT EXISTS _meta_quality (
     id              SERIAL PRIMARY KEY,
-    lineage_id      INTEGER NOT NULL REFERENCES _meta_lineage(id),
-    metric_name     VARCHAR(64) NOT NULL,
-    metric_value    DOUBLE PRECISION,
+    dataset_id      INTEGER NOT NULL REFERENCES _meta_datasets(id),
+    ledger_start    BIGINT NOT NULL,
+    ledger_end      BIGINT NOT NULL,
+    passed          BOOLEAN NOT NULL,
+    error_message   TEXT,  -- null if passed, error details if failed
     created_at      TIMESTAMPTZ DEFAULT NOW(),
 
-    UNIQUE(lineage_id, metric_name)
+    UNIQUE(dataset_id, ledger_start, ledger_end)
 );
+
+-- Index for finding failed validations
+CREATE INDEX IF NOT EXISTS idx_quality_failed
+    ON _meta_quality(dataset_id, passed) WHERE NOT passed;
 
 -- Schema evolution tracking
 CREATE TABLE IF NOT EXISTS _meta_changes (

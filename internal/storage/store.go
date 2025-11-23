@@ -87,6 +87,10 @@ type BronzeStore interface {
 	// Exists checks if a partition already exists.
 	Exists(ctx context.Context, ref PartitionRef) (bool, error)
 
+	// URI returns the canonical URI for the given key.
+	// For local: file:///path, GCS: gs://bucket/path, S3: s3://bucket/path
+	URI(key string) string
+
 	// Close releases any resources.
 	Close() error
 }

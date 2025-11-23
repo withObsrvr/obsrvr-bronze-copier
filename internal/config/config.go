@@ -110,6 +110,10 @@ type CheckpointConfig struct {
 // PerfConfig defines performance settings.
 type PerfConfig struct {
 	MaxInFlightPartitions int `yaml:"max_in_flight_partitions"`
+	Workers               int `yaml:"workers"`           // Number of parallel workers (default: MaxInFlightPartitions)
+	QueueSize             int `yaml:"queue_size"`        // Work queue size (default: Workers * 2)
+	RetryAttempts         int `yaml:"retry_attempts"`    // Max retries per partition (default: 3)
+	RetryBackoffMs        int `yaml:"retry_backoff_ms"`  // Initial backoff in ms (default: 1000)
 }
 
 // MustLoad loads configuration from YAML file or environment variables.
@@ -237,6 +241,18 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Perf.MaxInFlightPartitions == 0 {
 		cfg.Perf.MaxInFlightPartitions = 4
+	}
+	if cfg.Perf.Workers == 0 {
+		cfg.Perf.Workers = cfg.Perf.MaxInFlightPartitions
+	}
+	if cfg.Perf.QueueSize == 0 {
+		cfg.Perf.QueueSize = cfg.Perf.Workers * 2
+	}
+	if cfg.Perf.RetryAttempts == 0 {
+		cfg.Perf.RetryAttempts = 3
+	}
+	if cfg.Perf.RetryBackoffMs == 0 {
+		cfg.Perf.RetryBackoffMs = 1000
 	}
 }
 

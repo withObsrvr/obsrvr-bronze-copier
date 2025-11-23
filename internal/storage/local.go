@@ -96,6 +96,12 @@ func (s *LocalStore) Exists(ctx context.Context, ref PartitionRef) (bool, error)
 	return false, err
 }
 
+// URI returns the canonical URI for the given key.
+func (s *LocalStore) URI(key string) string {
+	absPath := filepath.Join(s.baseDir, key)
+	return "file://" + absPath
+}
+
 // Close is a no-op for local storage.
 func (s *LocalStore) Close() error {
 	return nil
