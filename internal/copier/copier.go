@@ -90,7 +90,18 @@ func (c *Copier) Run(ctx context.Context) error {
 		startLedger = c.cfg.Era.LedgerStart
 	}
 
-	log.Printf("[copier] starting era=%s version=%s network=%s range=%d-%d partition_size=%d",
+	// Use parallel mode if configured
+	maxInFlight := c.cfg.Perf.MaxInFlightPartitions
+	if maxInFlight > 1 {
+		return c.runParallel(ctx, startLedger, maxInFlight)
+	}
+
+	return c.runSequential(ctx, startLedger)
+}
+
+// runSequential runs the copier in sequential mode (one partition at a time).
+func (c *Copier) runSequential(ctx context.Context, startLedger uint32) error {
+	log.Printf("[copier] starting (sequential) era=%s version=%s network=%s range=%d-%d partition_size=%d",
 		c.cfg.Era.EraID, c.cfg.Era.VersionLabel, c.cfg.Era.Network,
 		startLedger, c.cfg.Era.LedgerEnd, c.cfg.Era.PartitionSize)
 
@@ -160,6 +171,98 @@ func (c *Copier) Run(ctx context.Context) error {
 				elapsed := time.Since(startTime)
 				rate := float64(ledgerCount) / elapsed.Seconds()
 				log.Printf("[copier] progress: %d ledgers, %d partitions, %.2f ledgers/sec",
+					ledgerCount, partitionCount, rate)
+			}
+		}
+	}
+}
+
+// runParallel runs the copier with parallel partition commits.
+func (c *Copier) runParallel(ctx context.Context, startLedger uint32, maxInFlight int) error {
+	log.Printf("[copier] starting (parallel, workers=%d) era=%s version=%s network=%s range=%d-%d partition_size=%d",
+		maxInFlight, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, c.cfg.Era.Network,
+		startLedger, c.cfg.Era.LedgerEnd, c.cfg.Era.PartitionSize)
+
+	// Start streaming ledgers
+	ledgersCh, errCh := c.src.Stream(ctx, startLedger, c.cfg.Era.LedgerEnd)
+
+	pc := NewParallelCommitter(c, maxInFlight)
+	ledgerCount := 0
+	partitionCount := 0
+	startTime := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Flush any remaining ledgers
+			if remaining := c.builder.FlushRemaining(); remaining != nil {
+				log.Printf("[copier] flushing remaining %d ledgers on shutdown", len(remaining.Ledgers))
+				if err := pc.CommitAsync(ctx, *remaining); err != nil {
+					log.Printf("[copier] error flushing remaining: %v", err)
+				}
+			}
+			// Wait for all in-flight commits
+			if err := pc.Flush(ctx); err != nil {
+				log.Printf("[copier] error flushing parallel commits: %v", err)
+			}
+			return c.src.Close()
+
+		case err := <-errCh:
+			if err != nil {
+				// Flush before returning error
+				_ = pc.Flush(ctx)
+				return fmt.Errorf("source error: %w", err)
+			}
+			// Error channel closed, continue
+
+		case lcm, ok := <-ledgersCh:
+			if !ok {
+				// Stream complete - flush remaining
+				if remaining := c.builder.FlushRemaining(); remaining != nil {
+					log.Printf("[copier] flushing final partition with %d ledgers", len(remaining.Ledgers))
+					if err := pc.CommitAsync(ctx, *remaining); err != nil {
+						return fmt.Errorf("commit final partition: %w", err)
+					}
+					partitionCount++
+				}
+
+				// Wait for all in-flight commits to complete and emit PAS events
+				if err := pc.Flush(ctx); err != nil {
+					return fmt.Errorf("flush parallel commits: %w", err)
+				}
+
+				elapsed := time.Since(startTime)
+				rate := float64(ledgerCount) / elapsed.Seconds()
+				log.Printf("[copier] complete: %d ledgers, %d partitions, %.2f ledgers/sec",
+					ledgerCount, partitionCount, rate)
+				return nil
+			}
+
+			ledgerCount++
+
+			if err := c.builder.Add(lcm); err != nil {
+				_ = pc.Flush(ctx)
+				return fmt.Errorf("add ledger %d: %w", lcm.LedgerSeq, err)
+			}
+
+			if c.builder.Ready() {
+				part := c.builder.Flush()
+
+				// Validate contiguity
+				if err := part.ValidateContiguity(); err != nil {
+					_ = pc.Flush(ctx)
+					return fmt.Errorf("partition validation failed: %w", err)
+				}
+
+				if err := pc.CommitAsync(ctx, part); err != nil {
+					return fmt.Errorf("start commit partition %d-%d: %w", part.Start, part.End, err)
+				}
+				partitionCount++
+
+				// Log progress
+				elapsed := time.Since(startTime)
+				rate := float64(ledgerCount) / elapsed.Seconds()
+				log.Printf("[copier] progress: %d ledgers, %d partitions queued, %.2f ledgers/sec",
 					ledgerCount, partitionCount, rate)
 			}
 		}
