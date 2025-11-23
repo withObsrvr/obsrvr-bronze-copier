@@ -360,3 +360,152 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 
 	return nil
 }
+
+// writePartitionToStorage writes the parquet data and manifest to storage.
+// This is safe to call concurrently.
+func (c *Copier) writePartitionToStorage(ctx context.Context, part tables.Partition, output *tables.ParquetOutput) error {
+	for tableName, parquetBytes := range output.Parquets {
+		ref := storage.PartitionRef{
+			Network:      c.cfg.Era.Network,
+			EraID:        c.cfg.Era.EraID,
+			VersionLabel: c.cfg.Era.VersionLabel,
+			Table:        tableName,
+			LedgerStart:  part.Start,
+			LedgerEnd:    part.End,
+		}
+
+		// Check if partition already exists
+		if exists, _ := c.store.Exists(ctx, ref); exists && !c.cfg.Era.AllowOverwrite {
+			return fmt.Errorf("partition already exists: %s range=%d-%d", tableName, part.Start, part.End)
+		}
+
+		// Write parquet
+		if err := c.store.WriteParquet(ctx, ref, parquetBytes); err != nil {
+			return fmt.Errorf("write parquet %s: %w", tableName, err)
+		}
+
+		// Write manifest
+		manifest := &storage.Manifest{
+			Partition: storage.PartitionInfo{
+				Start:        part.Start,
+				End:          part.End,
+				EraID:        c.cfg.Era.EraID,
+				VersionLabel: c.cfg.Era.VersionLabel,
+				Network:      c.cfg.Era.Network,
+			},
+			Tables: map[string]storage.TableInfo{
+				tableName: {
+					File:     fmt.Sprintf("part-%d-%d.parquet", part.Start, part.End),
+					Checksum: output.Checksums[tableName],
+					RowCount: output.RowCounts[tableName],
+					ByteSize: int64(len(parquetBytes)),
+				},
+			},
+			Producer: storage.ProducerInfo{
+				Name:    "bronze-copier",
+				Version: Version,
+				GitSHA:  GitSHA,
+			},
+			CreatedAt: time.Now().UTC(),
+		}
+
+		if err := c.store.WriteManifest(ctx, ref, manifest); err != nil {
+			return fmt.Errorf("write manifest %s: %w", tableName, err)
+		}
+
+		log.Printf("[partition] wrote %s: %d rows, %d bytes, checksum=%s",
+			tableName, output.RowCounts[tableName], len(parquetBytes), output.Checksums[tableName])
+	}
+	return nil
+}
+
+// recordPartitionMetadata records the partition in the catalog.
+// This is safe to call concurrently.
+func (c *Copier) recordPartitionMetadata(ctx context.Context, part tables.Partition, output *tables.ParquetOutput) {
+	if c.datasetID == 0 {
+		return
+	}
+
+	// Calculate total byte size
+	var totalBytes int64
+	for _, parquetBytes := range output.Parquets {
+		totalBytes += int64(len(parquetBytes))
+	}
+
+	// Build storage path
+	storagePath := fmt.Sprintf("%s/%s/%s/ledgers_lcm_raw/range=%d-%d",
+		c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, part.Start, part.End)
+
+	if err := c.meta.RecordPartition(ctx, metadata.PartitionRecord{
+		DatasetID:       c.datasetID,
+		EraID:           c.cfg.Era.EraID,
+		VersionLabel:    c.cfg.Era.VersionLabel,
+		Start:           part.Start,
+		End:             part.End,
+		Checksums:       output.Checksums,
+		RowCounts:       output.RowCounts,
+		ByteSize:        totalBytes,
+		StoragePath:     storagePath,
+		ProducerVersion: fmt.Sprintf("bronze-copier@%s", Version),
+		ProducerGitSHA:  GitSHA,
+		SourceType:      c.cfg.Source.Mode,
+		SourceLocation:  c.sourceLocation(),
+	}); err != nil {
+		log.Printf("[partition] warning: failed to record metadata: %v", err)
+	}
+}
+
+// emitPASEvent emits a PAS event for a partition.
+// This must be called sequentially to maintain hash chain ordering.
+func (c *Copier) emitPASEvent(ctx context.Context, part tables.Partition, output *tables.ParquetOutput) error {
+	// Build storage paths and byte sizes for each table
+	storagePaths := make(map[string]string)
+	byteSizes := make(map[string]int64)
+	for tableName, parquetBytes := range output.Parquets {
+		storagePaths[tableName] = fmt.Sprintf("%s/%s/%s/%s/range=%d-%d",
+			c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, tableName, part.Start, part.End)
+		byteSizes[tableName] = int64(len(parquetBytes))
+	}
+
+	return c.pas.EmitPartition(ctx, pas.Event{
+		EraID:        c.cfg.Era.EraID,
+		VersionLabel: c.cfg.Era.VersionLabel,
+		Network:      c.cfg.Era.Network,
+		Start:        part.Start,
+		End:          part.End,
+		Checksums:    output.Checksums,
+		RowCounts:    output.RowCounts,
+		ByteSizes:    byteSizes,
+		StoragePaths: storagePaths,
+		Producer: pas.ProducerInfo{
+			Name:    "bronze-copier",
+			Version: Version,
+			GitSHA:  GitSHA,
+		},
+	})
+}
+
+// saveCheckpoint saves the checkpoint for a partition.
+// This should be called sequentially after PAS emission.
+func (c *Copier) saveCheckpoint(ctx context.Context, part tables.Partition, output *tables.ParquetOutput) {
+	if c.checkpoint == nil {
+		return
+	}
+
+	cp := &checkpoint.Checkpoint{
+		CopierID:            c.cfg.CopierID,
+		Network:             c.cfg.Era.Network,
+		EraID:               c.cfg.Era.EraID,
+		VersionLabel:        c.cfg.Era.VersionLabel,
+		LastCommittedLedger: part.End,
+		LastPartition: &checkpoint.PartitionInfo{
+			Start:    part.Start,
+			End:      part.End,
+			Checksum: output.Checksums["ledgers_lcm_raw"],
+		},
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := c.checkpoint.Save(ctx, cp); err != nil {
+		log.Printf("[partition] warning: failed to save checkpoint: %v", err)
+	}
+}
