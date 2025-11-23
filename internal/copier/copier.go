@@ -308,12 +308,30 @@ func (c *Copier) commitPartition(ctx context.Context, part tables.Partition) err
 
 	// Emit PAS event
 	if c.cfg.PAS.Enabled {
+		// Build storage paths and byte sizes for each table
+		storagePaths := make(map[string]string)
+		byteSizes := make(map[string]int64)
+		for tableName, parquetBytes := range output.Parquets {
+			storagePaths[tableName] = fmt.Sprintf("%s/%s/%s/%s/range=%d-%d",
+				c.cfg.Era.Network, c.cfg.Era.EraID, c.cfg.Era.VersionLabel, tableName, part.Start, part.End)
+			byteSizes[tableName] = int64(len(parquetBytes))
+		}
+
 		if err := c.pas.EmitPartition(ctx, pas.Event{
 			EraID:        c.cfg.Era.EraID,
 			VersionLabel: c.cfg.Era.VersionLabel,
+			Network:      c.cfg.Era.Network,
 			Start:        part.Start,
 			End:          part.End,
 			Checksums:    output.Checksums,
+			RowCounts:    output.RowCounts,
+			ByteSizes:    byteSizes,
+			StoragePaths: storagePaths,
+			Producer: pas.ProducerInfo{
+				Name:    "bronze-copier",
+				Version: Version,
+				GitSHA:  GitSHA,
+			},
 		}); err != nil {
 			log.Printf("[partition] warning: failed to emit PAS event: %v", err)
 			// Don't fail the partition for PAS errors (for now)
